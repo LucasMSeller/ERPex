@@ -1,0 +1,25 @@
+{% if not pedidos %}
+<p class="text-slate-400 text-sm">Nenhum pedido aguardando embalagem no momento.</p>
+{% endif %}
+{% if pedidos %}
+<div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+  {% for p in pedidos %}
+  <div class="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden"
+       {% if cores and cores.get(p.empresa) %}style="border-left: 6px solid {{ cores.get(p.empresa) }};"{% endif %}>
+    <div class="px-4 py-2 bg-slate-900 text-white flex items-center justify-between text-xs">
+      <span>{{ p.empresa }}</span>
+      <span class="text-slate-300">Impresso {{ p.impresso_em or "—" }}</span>
+    </div>
+    <div class="p-4 space-y-1 text-sm">
+      <div class="font-mono text-slate-500">Venda {{ p.venda }}</div>
+      {% for item in p.itens %}
+      <div class="flex items-center justify-between border-b border-slate-100 pb-1 last:border-0 last:pb-0">
+        <span>{{ item.sku }}</span>
+        <span class="text-slate-500">x{{ item.qtd }}</span>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}

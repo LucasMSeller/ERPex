@@ -1,0 +1,276 @@
+<div class="mb-4 flex items-center justify-between gap-2 border-b border-slate-200">
+  <div class="flex gap-1">
+    <button type="button" class="aba-principal-btn px-4 py-2 text-sm border-b-2 -mb-px" data-alvo="aba-hoje">Hoje</button>
+    <button type="button" class="aba-principal-btn px-4 py-2 text-sm border-b-2 -mb-px" data-alvo="aba-proximos">Próximos envios</button>
+    <button type="button" class="aba-principal-btn px-4 py-2 text-sm border-b-2 -mb-px" data-alvo="aba-devolucoes">Devoluções</button>
+  </div>
+  <div class="flex items-center gap-2 pb-2">
+    <button type="button" id="cancelar-selecao-btn" class="hidden text-xs text-slate-500 hover:text-slate-800 underline whitespace-nowrap">
+      Cancelar seleção
+    </button>
+    <button type="button" id="imprimir-selecionados-btn" class="hidden bg-slate-900 text-white rounded-lg px-3 py-1.5 text-sm font-medium hover:bg-slate-800 whitespace-nowrap">
+      Imprimir
+    </button>
+    <div class="relative">
+      <button type="button" id="imprimir-menu-btn" class="bg-slate-900 text-white rounded-lg px-3 py-1.5 text-sm font-medium hover:bg-slate-800 whitespace-nowrap">
+        Imprimir ▾
+      </button>
+      <div id="imprimir-menu" class="hidden absolute right-0 z-20 mt-1 bg-white border border-slate-200 rounded-lg shadow-lg text-sm w-52 py-1">
+        <button type="button" data-acao="todos" class="imprimir-opcao block w-full text-left px-3 py-2 hover:bg-slate-50">Todos</button>
+        <button type="button" data-acao="hoje" class="imprimir-opcao block w-full text-left px-3 py-2 hover:bg-slate-50">De hoje</button>
+        <div class="border-t border-slate-100 mt-1 pt-1">
+          <div class="px-3 py-1 text-xs text-slate-400">Por loja</div>
+          <div id="imprimir-lojas-lista"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="confirmar-modal" class="hidden fixed inset-0 bg-black/40 z-30 flex items-center justify-center px-4">
+  <div class="bg-white rounded-xl shadow-lg p-5 max-w-sm w-full">
+    <p id="confirmar-texto" class="text-sm text-slate-700 mb-4"></p>
+    <div class="flex justify-end gap-2">
+      <button type="button" id="confirmar-cancelar" class="text-sm px-3 py-1.5 rounded-lg border border-slate-300 hover:bg-slate-50">Cancelar</button>
+      <button type="button" id="confirmar-ok" class="text-sm px-3 py-1.5 rounded-lg bg-slate-900 text-white hover:bg-slate-800">Confirmar impressão</button>
+    </div>
+  </div>
+</div>
+
+<div id="aba-hoje" class="aba-principal-conteudo">
+  <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+    {% if not hoje %}
+    <p class="text-slate-400 text-sm col-span-full">Nenhum pedido pra hoje.</p>
+    {% endif %}
+    {% for p in hoje %}
+      {% include "_mural_card.html" %}
+    {% endfor %}
+  </div>
+</div>
+
+<div id="aba-proximos" class="aba-principal-conteudo">
+  {% if not dias and not meses %}
+  <p class="text-slate-400 text-sm">Nenhum próximo envio.</p>
+  {% endif %}
+
+  {% if dias or meses %}
+  <div class="mb-4 flex flex-wrap gap-1 border-b border-slate-200">
+    {% for d in dias %}
+    <button type="button" class="suba-btn px-3 py-1.5 text-sm border-b-2 -mb-px" data-alvo="suba-dia-{{ loop.index }}">{{ d.label }}</button>
+    {% endfor %}
+    {% for m in meses %}
+    <button type="button" class="suba-btn px-3 py-1.5 text-sm border-b-2 -mb-px" data-alvo="suba-mes-{{ loop.index }}">{{ m.label }}</button>
+    {% endfor %}
+  </div>
+
+  {% for d in dias %}
+  <div id="suba-dia-{{ loop.index }}" class="suba-conteudo grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+    {% for p in d.pedidos %}
+      {% include "_mural_card.html" %}
+    {% endfor %}
+  </div>
+  {% endfor %}
+
+  {% for m in meses %}
+  <div id="suba-mes-{{ loop.index }}" class="suba-conteudo grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+    {% for p in m.pedidos %}
+      {% include "_mural_card.html" %}
+    {% endfor %}
+  </div>
+  {% endfor %}
+  {% endif %}
+</div>
+
+<div id="aba-devolucoes" class="aba-principal-conteudo">
+  <div id="devolucoes" data-poll hx-preserve="true" hx-get="/mural/devolucoes" hx-trigger="load, poll-tick" hx-swap="innerHTML"></div>
+</div>
+
+<script>
+(function() {
+  function marcarAtivo(botoes, alvo, classeAtiva, classesInativas) {
+    botoes.forEach(function(b) {
+      var ativo = b.dataset.alvo === alvo;
+      classeAtiva.forEach(function(c) { b.classList.toggle(c, ativo); });
+      classesInativas.forEach(function(c) { b.classList.toggle(c, !ativo); });
+    });
+  }
+
+  function ativarPrincipal(alvo) {
+    marcarAtivo(document.querySelectorAll('.aba-principal-btn'), alvo,
+      ['border-slate-900', 'text-slate-900', 'font-medium'],
+      ['border-transparent', 'text-slate-500']);
+    document.querySelectorAll('.aba-principal-conteudo').forEach(function(c) {
+      c.classList.toggle('hidden', c.id !== alvo);
+    });
+  }
+
+  function ativarSub(alvo) {
+    marcarAtivo(document.querySelectorAll('.suba-btn'), alvo,
+      ['border-slate-700', 'text-slate-800', 'font-medium'],
+      ['border-transparent', 'text-slate-400']);
+    document.querySelectorAll('.suba-conteudo').forEach(function(c) {
+      c.classList.toggle('hidden', c.id !== alvo);
+    });
+  }
+
+  document.querySelectorAll('.aba-principal-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      sessionStorage.setItem('mural_aba_principal', btn.dataset.alvo);
+      ativarPrincipal(btn.dataset.alvo);
+    });
+  });
+  document.querySelectorAll('.suba-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      sessionStorage.setItem('mural_aba_sub', btn.dataset.alvo);
+      ativarSub(btn.dataset.alvo);
+    });
+  });
+
+  // Restaura a aba/subaba que estava ativa antes do último refresh (se ainda existir);
+  // senão cai na primeira. Evita resetar a navegação a cada poll de 10s.
+  var principalBtns = document.querySelectorAll('.aba-principal-btn');
+  var principalSalva = sessionStorage.getItem('mural_aba_principal');
+  var principalAlvo = (principalSalva && document.getElementById(principalSalva))
+    ? principalSalva : (principalBtns[0] && principalBtns[0].dataset.alvo);
+  if (principalAlvo) ativarPrincipal(principalAlvo);
+
+  var subBtns = document.querySelectorAll('.suba-btn');
+  var subSalva = sessionStorage.getItem('mural_aba_sub');
+  var subAlvo = (subSalva && document.getElementById(subSalva))
+    ? subSalva : (subBtns[0] && subBtns[0].dataset.alvo);
+  if (subAlvo) ativarSub(subAlvo);
+})();
+</script>
+
+<script>
+(function() {
+  function checks() { return Array.from(document.querySelectorAll('.pedido-check')); }
+  function selecionados() {
+    return checks().filter(function(c) { return c.checked; }).map(function(c) { return c.dataset.venda; });
+  }
+
+  function atualizarUI() {
+    var sel = selecionados();
+    var menuBtn = document.getElementById('imprimir-menu-btn');
+    var selBtn = document.getElementById('imprimir-selecionados-btn');
+    var cancelarBtn = document.getElementById('cancelar-selecao-btn');
+    if (sel.length > 0) {
+      menuBtn.classList.add('hidden');
+      selBtn.classList.remove('hidden');
+      cancelarBtn.classList.remove('hidden');
+      selBtn.textContent = 'Imprimir (' + sel.length + (sel.length > 1 ? ' selecionados)' : ' selecionado)');
+    } else {
+      menuBtn.classList.remove('hidden');
+      selBtn.classList.add('hidden');
+      cancelarBtn.classList.add('hidden');
+    }
+    checks().forEach(function(c) {
+      var card = c.closest('.pedido-card');
+      if (card) {
+        card.classList.toggle('ring-2', c.checked);
+        card.classList.toggle('ring-slate-900', c.checked);
+      }
+    });
+    document.getElementById('imprimir-menu').classList.add('hidden');
+  }
+
+  // Reconstrói a lista "Por loja" a partir das empresas presentes nos pedidos
+  // carregados agora (evita depender de contexto extra do backend).
+  function montarListaLojas() {
+    var empresas = Array.from(new Set(checks().map(function(c) { return c.dataset.empresa; }).filter(Boolean))).sort();
+    var lista = document.getElementById('imprimir-lojas-lista');
+    lista.innerHTML = '';
+    empresas.forEach(function(emp) {
+      var qtd = checks().filter(function(c) { return c.dataset.empresa === emp; }).length;
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'imprimir-opcao block w-full text-left px-3 py-2 hover:bg-slate-50';
+      btn.dataset.acao = 'loja';
+      btn.dataset.empresa = emp;
+      btn.textContent = emp + ' (' + qtd + ')';
+      lista.appendChild(btn);
+    });
+    if (!empresas.length) {
+      var vazio = document.createElement('div');
+      vazio.className = 'px-3 py-2 text-xs text-slate-400';
+      vazio.textContent = 'Nenhuma loja carregada.';
+      lista.appendChild(vazio);
+    }
+  }
+
+  checks().forEach(function(c) {
+    c.addEventListener('change', function() {
+      sessionStorage.setItem('mural_selecionados', JSON.stringify(selecionados()));
+      atualizarUI();
+    });
+  });
+
+  // Restaura seleção manual salva (sobrevive ao poll de 10s do mural).
+  (function restaurarSelecao() {
+    var salvo = sessionStorage.getItem('mural_selecionados');
+    if (!salvo) return;
+    try {
+      var vendas = new Set(JSON.parse(salvo));
+      checks().forEach(function(c) { c.checked = vendas.has(c.dataset.venda); });
+    } catch (e) {}
+  })();
+  montarListaLojas();
+  atualizarUI();
+
+  document.getElementById('cancelar-selecao-btn').addEventListener('click', function() {
+    checks().forEach(function(c) { c.checked = false; });
+    sessionStorage.removeItem('mural_selecionados');
+    atualizarUI();
+  });
+
+  document.getElementById('imprimir-selecionados-btn').addEventListener('click', function() {
+    abrirConfirmacao(selecionados(), 'da seleção');
+  });
+
+  document.getElementById('imprimir-menu-btn').addEventListener('click', function(e) {
+    e.stopPropagation();
+    document.getElementById('imprimir-menu').classList.toggle('hidden');
+  });
+  document.addEventListener('click', function(e) {
+    var menu = document.getElementById('imprimir-menu');
+    if (!menu.contains(e.target) && e.target.id !== 'imprimir-menu-btn') menu.classList.add('hidden');
+  });
+
+  document.getElementById('imprimir-menu').addEventListener('click', function(e) {
+    var btn = e.target.closest('.imprimir-opcao');
+    if (!btn) return;
+    document.getElementById('imprimir-menu').classList.add('hidden');
+    if (btn.dataset.acao === 'todos') {
+      abrirConfirmacao(checks().map(function(c) { return c.dataset.venda; }), 'de todos os pendentes');
+    } else if (btn.dataset.acao === 'hoje') {
+      var doDia = checks().filter(function(c) { return !!c.closest('#aba-hoje'); }).map(function(c) { return c.dataset.venda; });
+      abrirConfirmacao(doDia, 'dos envios de hoje');
+    } else if (btn.dataset.acao === 'loja') {
+      var daLoja = checks().filter(function(c) { return c.dataset.empresa === btn.dataset.empresa; }).map(function(c) { return c.dataset.venda; });
+      abrirConfirmacao(daLoja, 'da loja ' + btn.dataset.empresa);
+    }
+  });
+
+  function abrirConfirmacao(vendas, descricao) {
+    if (!vendas.length) { alert('Nenhum pedido encontrado pra esse filtro.'); return; }
+    var texto = 'Confirma a impressão de ' + vendas.length +
+      (vendas.length > 1 ? ' etiquetas de separação ' : ' etiqueta de separação ') + descricao + '?';
+    document.getElementById('confirmar-texto').textContent = texto;
+    document.getElementById('confirmar-modal').dataset.vendas = JSON.stringify(vendas);
+    document.getElementById('confirmar-modal').classList.remove('hidden');
+  }
+
+  document.getElementById('confirmar-cancelar').addEventListener('click', function() {
+    document.getElementById('confirmar-modal').classList.add('hidden');
+  });
+  document.getElementById('confirmar-ok').addEventListener('click', function() {
+    var vendas = JSON.parse(document.getElementById('confirmar-modal').dataset.vendas || '[]');
+    document.getElementById('confirmar-modal').classList.add('hidden');
+    var qs = vendas.map(function(v) { return 'venda=' + encodeURIComponent(v); }).join('&');
+    window.open('/print/separacao-lote?' + qs, '_blank');
+    checks().forEach(function(c) { c.checked = false; });
+    sessionStorage.removeItem('mural_selecionados');
+    atualizarUI();
+  });
+})();
+</script>

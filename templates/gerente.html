@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block title %}Gerente — ERPex{% endblock %}
+{% block content %}
+<div class="flex items-center justify-between mb-2">
+  <h1 class="text-xl font-semibold">Painel do Gerente</h1>
+  <a href="/gerente/lojas" class="text-sm text-slate-600 hover:text-slate-900 underline">Conexão de lojas →</a>
+</div>
+<p class="text-sm text-slate-500 mb-6">Todos os pedidos, qualquer status. Use os filtros para restringir e o
+  seletor de status por linha para corrigir um pedido travado (ex.: etiqueta de separação perdida).</p>
+
+<div id="filtros" class="mb-4 text-sm">
+  <div class="flex flex-wrap items-center gap-4 mb-3">
+    {% for s in status_opcoes %}
+    <label class="flex items-center gap-1.5">
+      <input type="checkbox" name="status" value="{{ s }}" checked class="rounded border-slate-300">
+      {{ s }}
+    </label>
+    {% endfor %}
+    <input id="busca-gerente" name="busca" type="text" placeholder="Buscar venda, SKU, empresa, ID..."
+           class="border border-slate-300 rounded-lg px-3 py-1.5 text-sm w-64 focus:outline-none focus:ring-2 focus:ring-slate-800">
+    <select name="loja" class="border border-slate-300 rounded-lg px-2 py-1.5 text-sm">
+      <option value="">Todas as lojas</option>
+      {% for l in lojas_disponiveis %}
+      <option value="{{ l }}">{{ l }}</option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <div class="flex items-center justify-between flex-wrap gap-4">
+    <div class="flex items-center gap-1">
+      <label class="text-slate-500 text-xs">De</label>
+      <input type="date" name="dia_de" class="border border-slate-300 rounded-lg px-2 py-1.5 text-sm">
+      <label class="text-slate-500 text-xs">até</label>
+      <input type="date" name="dia_ate" class="border border-slate-300 rounded-lg px-2 py-1.5 text-sm">
+    </div>
+
+    <div class="flex items-center gap-3">
+      <select name="por_pagina" class="border border-slate-300 rounded-lg px-2 py-1.5 text-sm">
+        <option value="25">25 por página</option>
+        <option value="50" selected>50 por página</option>
+        <option value="100">100 por página</option>
+        <option value="0">Todos</option>
+      </select>
+
+      <div class="relative inline-block">
+        <button type="button" id="colunas-btn" class="text-sm border border-slate-300 rounded-lg px-3 py-1.5 hover:bg-slate-50">
+          Colunas ▾
+        </button>
+        <div id="colunas-painel" class="hidden absolute z-10 right-0 mt-1 bg-white border border-slate-200 rounded-lg shadow-lg p-3 text-sm space-y-1 whitespace-nowrap">
+          <label class="flex items-center gap-2"><input type="checkbox" class="coluna-toggle rounded border-slate-300" data-col="venda"> Venda</label>
+          <label class="flex items-center gap-2"><input type="checkbox" class="coluna-toggle rounded border-slate-300" data-col="pedido_ml"> Pedido (ML)</label>
+          <label class="flex items-center gap-2"><input type="checkbox" class="coluna-toggle rounded border-slate-300" data-col="empresa"> Empresa</label>
+          <label class="flex items-center gap-2"><input type="checkbox" class="coluna-toggle rounded border-slate-300" data-col="id_exped"> ID Expedição</label>
+          <label class="flex items-center gap-2"><input type="checkbox" class="coluna-toggle rounded border-slate-300" data-col="status"> Status</label>
+          <label class="flex items-center gap-2"><input type="checkbox" class="coluna-toggle rounded border-slate-300" data-col="impresso_em"> Impresso em</label>
+          <label class="flex items-center gap-2"><input type="checkbox" class="coluna-toggle rounded border-slate-300" data-col="itens"> Itens</label>
+          <label class="flex items-center gap-2"><input type="checkbox" class="coluna-toggle rounded border-slate-300" data-col="gaiola"> Gaiola</label>
+          <label class="flex items-center gap-2"><input type="checkbox" class="coluna-toggle rounded border-slate-300" data-col="corrigir_status"> Corrigir status</label>
+          <label class="flex items-center gap-2"><input type="checkbox" class="coluna-toggle rounded border-slate-300" data-col="etiqueta_ml"> Etiqueta ML</label>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="gerente-pedidos" hx-get="/gerente/pedidos"
+     hx-trigger="load, change from:#filtros, keyup changed delay:400ms from:#busca-gerente"
+     hx-include="#filtros" hx-swap="innerHTML">
+</div>
+
+<script>
+(function() {
+  var COLUNAS = ['venda', 'pedido_ml', 'empresa', 'id_exped', 'status', 'impresso_em',
+                 'itens', 'gaiola', 'corrigir_status', 'etiqueta_ml'];
+
+  function colunasVisiveis() {
+    var salvo = sessionStorage.getItem('gerente_colunas');
+    if (salvo) {
+      try { return JSON.parse(salvo); } catch (e) {}
+    }
+    return COLUNAS.slice();
+  }
+
+  function aplicar() {
+    var visiveis = colunasVisiveis();
+    document.querySelectorAll('.coluna-toggle').forEach(function(chk) {
+      chk.checked = visiveis.indexOf(chk.dataset.col) > -1;
+    });
+    var tabela = document.querySelector('#gerente-pedidos table');
+    if (!tabela) return;
+    COLUNAS.forEach(function(col, i) {
+      var n = i + 1;
+      var mostrar = visiveis.indexOf(col) > -1;
+      tabela.querySelectorAll('tr > :nth-child(' + n + ')').forEach(function(cel) {
+        cel.classList.toggle('hidden', !mostrar);
+      });
+    });
+  }
+
+  document.querySelectorAll('.coluna-toggle').forEach(function(chk) {
+    chk.addEventListener('change', function() {
+      var visiveis = colunasVisiveis();
+      if (chk.checked) {
+        if (visiveis.indexOf(chk.dataset.col) === -1) visiveis.push(chk.dataset.col);
+      } else {
+        visiveis = visiveis.filter(function(c) { return c !== chk.dataset.col; });
+      }
+      sessionStorage.setItem('gerente_colunas', JSON.stringify(visiveis));
+      aplicar();
+    });
+  });
+
+  document.getElementById('colunas-btn').addEventListener('click', function(e) {
+    e.stopPropagation();
+    document.getElementById('colunas-painel').classList.toggle('hidden');
+  });
+  document.addEventListener('click', function(e) {
+    var painel = document.getElementById('colunas-painel');
+    if (!painel.contains(e.target) && e.target.id !== 'colunas-btn') painel.classList.add('hidden');
+  });
+
+  document.body.addEventListener('htmx:afterSwap', function(evt) {
+    if (evt.target && evt.target.id === 'gerente-pedidos') aplicar();
+  });
+
+  aplicar();
+})();
+</script>
+{% endblock %}

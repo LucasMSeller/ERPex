@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% block title %}Embalagem — ERPex{% endblock %}
+{% block content %}
+<h1 class="text-xl font-semibold mb-2">Embalagem</h1>
+<p class="text-sm text-slate-500 mb-6">Bipe o QR da etiqueta de separação. Se válido, imprime a etiqueta do pedido e a do Mercado Livre e marca como Embalado.</p>
+
+<form id="form-bipar" class="mb-6">
+  <label class="block text-sm text-slate-600 mb-1">Bipar etiqueta de separação</label>
+  <input id="bipar-input" autocomplete="off" autofocus
+         class="w-full max-w-md border border-slate-300 rounded-lg px-3 py-2 text-lg font-mono
+                focus:outline-none focus:ring-2 focus:ring-slate-800">
+</form>
+
+<div id="status" class="text-sm rounded-lg px-3 py-2 border border-slate-200 bg-white max-w-md mb-8">
+  Aguardando bipagem…
+</div>
+
+<h2 class="text-sm font-semibold text-slate-600 mb-3">Aguardando embalagem</h2>
+<div id="embalagem-pedidos" data-poll hx-get="/embalagem/pedidos" hx-trigger="load, poll-tick, refresh" hx-swap="innerHTML">
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ cdn }}"></script>
+<script>
+  var CERT = {{ cert_js|safe }};
+  var PRINTER_PEDIDO = {{ printer_pedido_js|safe }};
+  var PRINTER_MELI = {{ printer_meli_js|safe }};
+
+  if (typeof qz !== 'undefined') {
+    qz.security.setCertificatePromise(function (resolve) { resolve(CERT); });
+    qz.security.setSignatureAlgorithm("SHA512");
+    qz.security.setSignaturePromise(function (toSign) {
+      return function (resolve, reject) {
+        fetch('/print/sign?request=' + encodeURIComponent(toSign))
+          .then(function (r) { return r.text(); }).then(resolve).catch(reject);
+      };
+    });
+  }
+
+  function setStatus(msg, tipo) {
+    var el = document.getElementById('status');
+    el.textContent = msg;
+    el.className = 'text-sm rounded-lg px-3 py-2 border max-w-md ' + (
+      tipo === 'erro' ? 'text-red-700 bg-red-50 border-red-200' :
+      tipo === 'ok' ? 'text-emerald-700 bg-emerald-50 border-emerald-200' :
+      'border-slate-200 bg-white text-slate-600'
+    );
+  }
+
+  function resetInput() {
+    var input = document.getElementById('bipar-input');
+    input.value = '';
+    input.focus();
+  }
+
+  function conectarQZ() {
+    return qz.websocket.isActive() ? Promise.resolve() : qz.websocket.connect();
+  }
+
+  function comoJson(r) {
+    var ct = r.headers.get('content-type') || '';
+    if (ct.indexOf('application/json') === -1) {
+      throw new Error('Sessão expirada — recarregue a página e faça login de novo.');
+    }
+    return r.json();
+  }
+
+  function getPrinter(nome) {
+    return nome ? qz.printers.find(nome) : qz.printers.getDefault();
+  }
+
+  function imprimirAmbas(zplPedido, zplMeli) {
+    return conectarQZ().then(function () {
+      var jobs = [
+        getPrinter(PRINTER_PEDIDO).then(function (printer) {
+          return qz.print(qz.configs.create(printer), [{ type: 'raw', format: 'plain', data: zplPedido }]);
+        }),
+      ];
+      if (zplMeli) {
+        jobs.push(getPrinter(PRINTER_MELI).then(function (printer) {
+          return qz.print(qz.configs.create(printer), [{ type: 'raw', format: 'plain', data: zplMeli }]);
+        }));
+      }
+      return Promise.all(jobs);
+    });
+  }
+
+  function processarCodigo(codigo) {
+    setStatus('Validando ' + codigo + '…', '');
+    fetch('/embalagem/validar', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ codigo: codigo }),
+    })
+      .then(comoJson)
+      .then(function (data) {
+        if (!data.ok) { setStatus(data.msg, 'erro'); resetInput(); return; }
+        if (typeof qz === 'undefined') { setStatus('QZ Tray não carregou (sem internet?).', 'erro'); resetInput(); return; }
+        setStatus('Imprimindo…', '');
+        imprimirAmbas(data.zpl_pedido, data.zpl_ml)
+          .then(function () {
+            return fetch('/embalagem/confirmar', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ venda: data.venda }),
+            });
+          })
+          .then(comoJson)
+          .then(function (conf) {
+            if (!conf.ok) throw new Error('Impresso, mas não consegui atualizar o status na planilha.');
+            var msg = 'Pedido ' + data.venda + ' embalado.' + (data.aviso ? ' (' + data.aviso + ')' : '');
+            setStatus(msg, 'ok');
+            resetInput();
+            htmx.trigger('#embalagem-pedidos', 'refresh');
+          })
+          .catch(function (err) {
+            setStatus('Falha ao imprimir — status NÃO alterado. ' + String(err), 'erro');
+            resetInput();
+          });
+      })
+      .catch(function (err) {
+        setStatus('Erro de rede: ' + String(err), 'erro');
+        resetInput();
+      });
+  }
+
+  document.getElementById('form-bipar').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var input = document.getElementById('bipar-input');
+    var codigo = input.value.trim();
+    input.value = '';
+    if (codigo) processarCodigo(codigo);
+  });
+</script>
+{% endblock %}

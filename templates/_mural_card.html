@@ -1,0 +1,50 @@
+{% set cancelado = p.status|lower == "cancelado" %}
+<div id="pedido-{{ p.venda | urlencode }}" class="pedido-card bg-white rounded-xl shadow-sm overflow-hidden {{ 'border-2 border-red-500' if cancelado else 'border border-slate-200' }}"
+     {% if not cancelado and cores and cores.get(p.empresa) %}style="border-left: 6px solid {{ cores.get(p.empresa) }};"{% endif %}>
+  <div class="px-4 py-3 {{ 'bg-red-700' if cancelado else 'bg-slate-900' }} text-white flex items-center justify-between text-sm">
+    {% if cancelado %}
+    <span class="font-semibold">⚠ Pedido cancelado</span>
+    {% else %}
+    <label class="flex items-center gap-2 cursor-pointer">
+      <input type="checkbox" class="pedido-check rounded border-slate-400"
+             data-venda="{{ p.venda }}" data-empresa="{{ p.empresa }}">
+      <span>Entrega até {{ p.data_limite or "—" }}</span>
+    </label>
+    {% endif %}
+    <span class="font-mono text-slate-300">{{ p.id_exped or "—" }}</span>
+  </div>
+  {% if cancelado %}
+  <div class="px-4 py-2 bg-red-50 text-red-700 text-xs">
+    Cancelado no Mercado Livre — travado até o Gerente finalizar em Notificações.
+  </div>
+  {% endif %}
+  <div class="p-4 space-y-2">
+    {% for item in p.itens %}
+    <div class="flex items-center justify-between text-sm border-b border-slate-100 pb-2 last:border-0 last:pb-0">
+      <div>
+        <div class="font-medium">{{ item.sku }}</div>
+        <div class="text-slate-500">{{ item.endereco or "Sem endereço" }}</div>
+      </div>
+      <div class="text-slate-600">Qtd {{ item.qtd }}</div>
+    </div>
+    {% endfor %}
+  </div>
+  <div class="px-4 py-2 border-t border-slate-100 flex flex-wrap items-center gap-4 text-sm">
+    <a class="text-slate-500 hover:text-slate-800" target="_blank"
+       href="/docs/nf-sefaz/{{ p.venda | urlencode }}?company={{ p.empresa | urlencode }}">Consultar NF</a>
+  </div>
+  <div class="px-4 pb-4">
+    {% if cancelado %}
+    <span class="block w-full text-center bg-slate-100 text-slate-400 rounded-lg py-2 text-sm font-medium cursor-not-allowed">
+      Impressão bloqueada — pedido cancelado
+    </span>
+    {% else %}
+    <a
+      class="block w-full text-center bg-slate-900 text-white rounded-lg py-2 text-sm font-medium hover:bg-slate-800"
+      target="_blank"
+      href="/print/separacao/{{ p.venda | urlencode }}?company={{ p.empresa | urlencode }}">
+      Imprimir etiqueta de separação
+    </a>
+    {% endif %}
+  </div>
+</div>

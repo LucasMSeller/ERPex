@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Mural — ERPex{% endblock %}
+{% block content %}
+<h1 class="text-xl font-semibold mb-4">Mural de expedição</h1>
+
+<div id="filtro-loja" class="flex flex-wrap gap-4 mb-6 text-sm">
+  {% for e in empresas %}
+  <label class="flex items-center gap-1.5">
+    <input type="checkbox" name="empresa" value="{{ e }}" checked class="rounded border-slate-300">
+    {{ e }}
+  </label>
+  {% endfor %}
+</div>
+
+<div id="pedidos" data-poll hx-get="/mural/pedidos" hx-trigger="load, poll-tick, change from:#filtro-loja"
+     hx-include="#filtro-loja" hx-swap="innerHTML">
+</div>
+{% endblock %}

@@ -1,0 +1,46 @@
+{% if mensagem %}
+<div class="mb-3 text-sm text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2 max-w-2xl">{{ mensagem }}</div>
+{% endif %}
+{% if not grupos %}
+<p class="text-slate-400 text-sm">Nenhum SKU cadastrado ainda.</p>
+{% endif %}
+{% for loja, enderecos in grupos %}
+<details class="bg-white border border-slate-200 rounded-xl max-w-2xl mb-4 overflow-hidden" {% if busca %}open{% endif %}>
+  <summary class="cursor-pointer select-none px-3 py-2 bg-slate-100 text-slate-700 text-sm font-semibold flex items-center justify-between">
+    <span>{{ loja }}</span>
+    <span class="flex items-center gap-2">
+      <span class="text-xs font-normal text-slate-500">{{ enderecos|length }} SKU{{ "s" if enderecos|length != 1 else "" }}</span>
+      {% if loja in lojas %}
+      <button type="button" onclick="event.preventDefault(); event.stopPropagation();"
+              hx-post="/enderecos/vincular-skus/{{ loja }}" hx-include="#busca-enderecos"
+              hx-target="#enderecos-lista" hx-swap="innerHTML"
+              hx-indicator="#vincular-indicador-{{ loop.index }}" hx-disabled-elt="this"
+              class="text-xs font-normal border border-slate-300 rounded px-2 py-1 bg-white hover:bg-slate-50 disabled:opacity-50">
+        Vincular SKUs
+      </button>
+      <span id="vincular-indicador-{{ loop.index }}" class="htmx-indicator text-xs font-normal text-slate-500">Buscando no ML…</span>
+      {% endif %}
+    </span>
+  </summary>
+  <div class="divide-y divide-slate-100">
+    <div class="grid grid-cols-[1fr_100px_100px_100px_80px] gap-2 px-3 py-2 bg-slate-50 text-slate-600 text-xs font-medium">
+      <div>SKU</div><div>Corredor</div><div>Estante</div><div>Prateleira</div><div></div>
+    </div>
+    {% for e in enderecos %}
+    <form class="grid grid-cols-[1fr_100px_100px_100px_80px] gap-2 px-3 py-2 items-center"
+          hx-post="/enderecos" hx-include="#busca-enderecos" hx-target="#enderecos-lista" hx-swap="innerHTML">
+      <input type="hidden" name="sku" value="{{ e.sku }}">
+      <div class="font-mono text-sm truncate self-center">{{ e.sku }}</div>
+      <input name="corredor" value="{{ e.corredor }}" class="border border-slate-300 rounded px-2 py-1 text-sm w-full">
+      <input name="estante" value="{{ e.estante }}" class="border border-slate-300 rounded px-2 py-1 text-sm w-full">
+      <input name="prateleira" value="{{ e.prateleira }}" class="border border-slate-300 rounded px-2 py-1 text-sm w-full">
+      <div class="flex items-center gap-1">
+        <button type="submit" hx-disabled-elt="this"
+                class="bg-slate-900 text-white rounded px-2 py-1 text-xs hover:bg-slate-800 disabled:opacity-50">Salvar</button>
+        <span class="htmx-indicator text-xs text-slate-500">…</span>
+      </div>
+    </form>
+    {% endfor %}
+  </div>
+</details>
+{% endfor %}

@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="pt-br" class="h-full">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}ERPex{% endblock %}</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/htmx.org@1.9.12"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+</style>
+</head>
+<body class="h-full bg-slate-50 text-slate-900">
+  <nav class="border-b border-slate-200 bg-white">
+    <div class="max-w-6xl mx-auto px-6 py-3 flex items-center justify-between">
+      <span class="font-semibold tracking-tight text-slate-800">ERPex</span>
+      <div class="flex items-center gap-6 text-sm">
+        <a href="/mural" class="text-slate-600 hover:text-slate-900">Mural</a>
+        <a href="/embalagem" class="text-slate-600 hover:text-slate-900">Embalagem</a>
+        <a href="/gaiolas" class="text-slate-600 hover:text-slate-900">Gaiolas</a>
+        <a href="/enderecos" class="text-slate-600 hover:text-slate-900">Endereços</a>
+        <a href="/gerente" class="text-slate-600 hover:text-slate-900">Gerente</a>
+        {% if request.session.get("gerente") %}
+        <a href="/gerente/notificacoes" class="text-red-600 hover:text-red-800">Notificações</a>
+        <a href="/gerente/logout" class="text-amber-600 hover:text-amber-800">Sair do Gerente</a>
+        {% endif %}
+        <a href="/logout" class="text-slate-400 hover:text-slate-600">Sair</a>
+      </div>
+    </div>
+  </nav>
+  <main class="max-w-6xl mx-auto px-6 py-8">
+    {% block content %}{% endblock %}
+  </main>
+  <script>
+  (function() {
+    // Polling "inteligente": telas ficam ligadas o dia todo, então em vez de
+    // bater a cada poucos segundos (caro no Cloud Run), varia o intervalo por
+    // horário — normal durante o expediente, bem mais espaçado à noite.
+    var MINUTOS_DIA = 3;
+    var MINUTOS_NOITE = 60;
+
+    function intervaloMs() {
+      var agora = new Date();
+      var h = agora.getHours() + agora.getMinutes() / 60;
+      var noite = (h >= 18.5 || h < 7.5);   // 18:30–07:30
+      return (noite ? MINUTOS_NOITE : MINUTOS_DIA) * 60 * 1000;
+    }
+
+    function tick() {
+      document.querySelectorAll('[data-poll]').forEach(function(el) {
+        htmx.trigger(el, 'poll-tick');
+      });
+      setTimeout(tick, intervaloMs());
+    }
+
+    setTimeout(tick, intervaloMs());
+  })();
+  </script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

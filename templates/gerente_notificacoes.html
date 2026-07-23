@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% block title %}Notificações — ERPex{% endblock %}
+{% block content %}
+<div class="flex items-center justify-between flex-wrap gap-2 mb-2">
+  <h1 class="text-xl font-semibold">Notificações</h1>
+  <button type="button" id="limpar-resolvidos-btn" class="text-sm border border-slate-300 rounded-lg px-3 py-1.5 hover:bg-slate-50">
+    Limpar (só o que precisa de ação)
+  </button>
+</div>
+<a href="/gerente" class="text-sm text-slate-500 hover:text-slate-800 underline">&larr; Voltar pro painel</a>
+<p class="text-sm text-slate-500 mt-3 mb-6">Registro permanente — cancelados e devoluções continuam aqui mesmo depois
+  de finalizados, como histórico. O que precisa de ação aparece em destaque; o que já foi resolvido fica esmaecido.</p>
+
+<h2 class="text-sm font-semibold text-slate-600 mb-3">Cancelados</h2>
+{% if not notificacoes %}
+<p class="text-slate-400 text-sm">Nenhum cancelamento registrado.</p>
+{% endif %}
+
+<div class="space-y-3">
+  {% for n in notificacoes %}
+  {% set p = n.pedido %}
+  {% set d = n.detalhe %}
+  {% set resolvido = n.resolvido %}
+  <details class="notif-item {{ 'notif-resolvido' if resolvido else '' }} bg-white border rounded-xl overflow-hidden {{ 'border-slate-200 opacity-60' if resolvido else 'border-red-200' }}">
+    <summary class="px-4 py-3 cursor-pointer flex items-center justify-between gap-4 flex-wrap {{ 'bg-slate-50' if resolvido else 'bg-red-50' }}">
+      <div class="text-sm flex items-center flex-wrap gap-2">
+        <span class="font-mono font-semibold">{{ p.venda }}</span>
+        <span class="text-slate-500">{{ p.empresa }}</span>
+        {% if d and d.data_evento %}
+        <span class="text-slate-400">cancelado em {{ d.data_evento.strftime("%d/%m/%Y %H:%M") }}</span>
+        {% endif %}
+        {% if resolvido %}
+        <span class="text-xs px-2 py-0.5 rounded-full bg-slate-200 text-slate-600">Finalizado</span>
+        {% else %}
+        <span class="text-xs px-2 py-0.5 rounded-full bg-red-200 text-red-900">Precisa finalizar</span>
+        {% endif %}
+      </div>
+      {% if not resolvido %}
+      <form onsubmit="return confirm('Finalizar o cancelamento de {{ p.venda }}? O card sai do Mural.');"
+            method="post" action="/gerente/notificacoes/{{ p.venda | urlencode }}/finalizar">
+        <button type="submit" class="bg-slate-900 text-white rounded px-3 py-1.5 text-xs font-medium hover:bg-slate-800">
+          Finalizar
+        </button>
+      </form>
+      {% endif %}
+    </summary>
+    <div class="px-4 py-3 border-t border-slate-100 text-sm space-y-1">
+      <p><span class="text-slate-500">Pedido (ML):</span> <span class="font-mono">{{ p.order_id or "—" }}</span></p>
+      <p><span class="text-slate-500">Status ML:</span> {{ d.status_ml if d else "—" }}</p>
+      <p><span class="text-slate-500">Motivo:</span> {{ (d.motivo if d else None) or "não informado pelo ML" }}</p>
+      <p class="text-slate-500">Itens:
+        {% for item in p.itens %}{{ item.sku }} (x{{ item.qtd }}){% if not loop.last %}, {% endif %}{% endfor %}
+      </p>
+    </div>
+  </details>
+  {% endfor %}
+</div>
+
+<h2 class="text-sm font-semibold text-slate-600 mt-8 mb-3">Devoluções</h2>
+{% if not devolucoes %}
+<p class="text-slate-400 text-sm">Nenhuma devolução registrada.</p>
+{% endif %}
+
+<div class="space-y-3">
+  {% for d in devolucoes %}
+  {% set resolvido = d.status == "Finalizada" %}
+  <details class="notif-item {{ 'notif-resolvido' if resolvido else '' }} bg-white border rounded-xl overflow-hidden {{ 'border-slate-200 opacity-60' if resolvido else 'border-amber-200' }}">
+    <summary class="px-4 py-3 cursor-pointer flex items-center justify-between gap-4 flex-wrap {{ 'bg-slate-50' if resolvido else 'bg-amber-50' }}">
+      <div class="text-sm flex items-center flex-wrap gap-2">
+        <span class="font-mono font-semibold">{{ d.venda_ml or d.order_id or "—" }}</span>
+        <span class="text-slate-500">{{ d.empresa or "—" }}</span>
+        <span class="text-slate-400">chegou em {{ d.criado_em.strftime("%d/%m/%Y") if d.criado_em else "—" }}</span>
+        {% if resolvido %}
+        <span class="text-xs px-2 py-0.5 rounded-full bg-slate-200 text-slate-600">Finalizada</span>
+        {% elif d.status_ml == "closed" %}
+        <span class="text-xs px-2 py-0.5 rounded-full bg-emerald-200 text-emerald-900">Fechada pelo ML — precisa finalizar</span>
+        {% else %}
+        <span class="text-xs px-2 py-0.5 rounded-full bg-amber-200 text-amber-900">Aberta no ML</span>
+        {% endif %}
+        {% if d.status == "Avaliado" and not resolvido %}
+        <span class="text-xs px-2 py-0.5 rounded-full bg-blue-100 text-blue-800">Revisão confirmada</span>
+        {% endif %}
+      </div>
+      {% if not resolvido %}
+      <form onsubmit="return confirm('Finalizar a devolução de {{ d.venda_ml or d.order_id }}? Aciona que já foi resolvida com a equipe de soluções.');"
+            method="post" action="/gerente/notificacoes/devolucao/{{ d.claim_id | urlencode }}/finalizar">
+        <button type="submit" class="bg-slate-900 text-white rounded px-3 py-1.5 text-xs font-medium hover:bg-slate-800">
+          Finalizar
+        </button>
+      </form>
+      {% endif %}
+    </summary>
+    <div class="px-4 py-3 border-t border-slate-100 text-sm space-y-1">
+      <p><span class="text-slate-500">Pedido (ML):</span> <span class="font-mono">{{ d.order_id or "—" }}</span></p>
+      <p><span class="text-slate-500">Tipo/estágio:</span> {{ d.tipo or "—" }} / {{ d.stage or "—" }}</p>
+      <p><span class="text-slate-500">Motivo:</span> {{ d.motivo or "não informado pelo ML" }}</p>
+      <p><span class="text-slate-500">Revisão da expedição:</span> {{ d.avaliacao or "ainda não confirmada" }}</p>
+    </div>
+  </details>
+  {% endfor %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function() {
+  var btn = document.getElementById('limpar-resolvidos-btn');
+  var limpo = false;
+  btn.addEventListener('click', function() {
+    limpo = !limpo;
+    document.querySelectorAll('.notif-resolvido').forEach(function(el) {
+      el.classList.toggle('hidden', limpo);
+    });
+    btn.textContent = limpo ? 'Mostrar tudo' : 'Limpar (só o que precisa de ação)';
+  });
+})();
+</script>
+{% endblock %}

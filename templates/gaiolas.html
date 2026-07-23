@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Gaiolas — ERPex{% endblock %}
+{% block content %}
+<h1 class="text-xl font-semibold mb-6">Gaiolas</h1>
+
+<form hx-post="/gaiolas/bipar" hx-target="#grid" hx-swap="innerHTML" class="mb-6">
+  <label class="block text-sm text-slate-600 mb-1">Bipar pacote (formato N|ID)</label>
+  <input id="bipar-input" name="codigo" autofocus autocomplete="off"
+         class="w-full max-w-md border border-slate-300 rounded-lg px-3 py-2 text-lg font-mono
+                focus:outline-none focus:ring-2 focus:ring-slate-800">
+</form>
+
+<div id="grid" data-poll hx-get="/gaiolas/estado" hx-trigger="load, poll-tick" hx-swap="innerHTML"></div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  document.body.addEventListener('htmx:afterSwap', function (e) {
+    if (e.target && e.target.id === 'grid') {
+      var input = document.getElementById('bipar-input');
+      if (input) { input.value = ''; input.focus(); }
+    }
+  });
+</script>
+{% endblock %}

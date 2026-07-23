@@ -1,0 +1,34 @@
+# Segredos e credenciais — nunca versionar
+.env
+.env.*
+!.env.example
+service_account.json
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# Ambientes virtuais
+venv/
+.venv/
+env/
+ENV/
+
+# IDEs / editores
+.vscode/
+.idea/
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# Logs e temporários
+*.log
+*.tmp
+
+# Ferramentas locais (Claude Code)
+.claude/

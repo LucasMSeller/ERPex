@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Lojas — ERPex{% endblock %}
+{% block content %}
+<h1 class="text-xl font-semibold mb-2">Conexão de lojas — Mercado Livre</h1>
+<a href="/gerente" class="text-sm text-slate-500 hover:text-slate-800 underline">&larr; Voltar pro painel</a>
+
+<div class="mt-6 bg-white border border-slate-200 rounded-xl overflow-hidden">
+  <table class="w-full text-sm text-left">
+    <thead class="bg-slate-100 text-slate-600">
+      <tr>
+        <th class="px-3 py-2">Loja</th>
+        <th class="px-3 py-2">Nickname ML</th>
+        <th class="px-3 py-2">User ID</th>
+        <th class="px-3 py-2">Cor do card</th>
+        <th class="px-3 py-2">Prefixo do SKU</th>
+        <th class="px-3 py-2"></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% if not lojas %}
+      <tr><td colspan="6" class="px-3 py-4 text-slate-400">Nenhuma loja conectada ainda.</td></tr>
+      {% endif %}
+      {% for l in lojas %}
+      <tr class="border-t border-slate-100">
+        <td class="px-3 py-2">{{ l.company_key }}</td>
+        <td class="px-3 py-2 text-slate-500">{{ l.nickname }}</td>
+        <td class="px-3 py-2 font-mono text-slate-500">{{ l.user_id }}</td>
+        <td class="px-3 py-2">
+          <form method="post" action="/gerente/lojas/{{ l.user_id }}/cor">
+            <input type="color" name="cor" value="{{ l.cor or '#0f172a' }}"
+                   class="w-10 h-8 border border-slate-300 rounded cursor-pointer"
+                   onchange="this.form.requestSubmit()">
+          </form>
+        </td>
+        <td class="px-3 py-2">
+          <form method="post" action="/gerente/lojas/{{ l.user_id }}/prefixo" class="flex items-center gap-1">
+            <input type="text" name="sku_prefixo" value="{{ l.sku_prefixo or '' }}" placeholder="ex: PREP"
+                   class="w-24 border border-slate-300 rounded px-2 py-1 text-sm font-mono uppercase">
+            <button type="submit" class="text-xs border border-slate-300 rounded px-2 py-1 hover:bg-slate-50">Salvar</button>
+          </form>
+        </td>
+        <td class="px-3 py-2">
+          <form method="post" action="/gerente/lojas/{{ l.user_id }}/desconectar"
+                onsubmit="return confirm('Desconectar {{ l.company_key }}? Vai precisar reconectar via OAuth depois.');">
+            <button type="submit" class="text-red-600 hover:text-red-800 text-xs font-medium">Desconectar</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="mt-8 max-w-sm">
+  <h2 class="text-sm font-semibold mb-2">Conectar nova loja</h2>
+  <form class="flex items-center gap-2"
+        onsubmit="event.preventDefault(); var v = document.getElementById('nova-loja').value.trim(); if (v) window.location = '/auth/meli/login?company=' + encodeURIComponent(v);">
+    <input id="nova-loja" type="text" placeholder="Nome da loja (ex: Empresa B)"
+           class="flex-1 border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-800">
+    <button type="submit" class="bg-slate-900 text-white rounded-lg px-4 py-2 text-sm font-medium hover:bg-slate-800">Conectar</button>
+  </form>
+  <p class="text-xs text-slate-400 mt-2">Abre o fluxo de autorização do Mercado Livre nessa mesma aba.</p>
+</div>
+{% endblock %}

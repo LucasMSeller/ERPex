@@ -1,0 +1,60 @@
+{% if not devolucoes %}
+<p class="text-slate-400 text-sm">Nenhuma devolução pendente.</p>
+{% endif %}
+
+<div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+  {% for d in devolucoes %}
+  <div class="bg-white rounded-xl shadow-sm overflow-hidden border-2 border-amber-400">
+    <div class="px-4 py-3 bg-amber-600 text-white flex items-center justify-between text-sm">
+      <span class="font-semibold">↩ Devolução</span>
+      <span class="font-mono text-amber-100">{{ d.venda_ml or d.order_id or "—" }}</span>
+    </div>
+
+    <div class="px-4 py-3 text-sm space-y-1 border-b border-amber-100">
+      <p>
+        <span class="text-xs px-2 py-0.5 rounded-full
+          {{ 'bg-emerald-100 text-emerald-800' if d.fase == 'A revisar' else 'bg-amber-100 text-amber-800' }}">
+          {{ d.fase or "Em preparação" }}
+        </span>
+      </p>
+      <p><span class="text-slate-500">Loja:</span> {{ d.empresa or "—" }}</p>
+      <p><span class="text-slate-500">Registrado em:</span> {{ d.criado_em.strftime("%d/%m/%Y") if d.criado_em else "—" }}</p>
+      {% if d.motivo %}<p><span class="text-slate-500">Motivo:</span> {{ d.motivo }}</p>{% endif %}
+    </div>
+
+    <div class="p-4 space-y-2">
+      {% if d.itens %}
+        {% for item in d.itens %}
+        <div class="flex items-center justify-between text-sm border-b border-slate-100 pb-2 last:border-0 last:pb-0">
+          <div class="font-medium">{{ item.sku }}</div>
+          <div class="text-slate-600">Qtd {{ item.qtd }}</div>
+        </div>
+        {% endfor %}
+      {% else %}
+      <p class="text-slate-400 text-sm">Pedido não encontrado na aba Vendas (order_id: {{ d.order_id or "—" }}).</p>
+      {% endif %}
+    </div>
+
+    <div class="px-4 pb-4">
+      {% if d.status != "Recebida" %}
+      <div class="bg-emerald-50 rounded-lg px-3 py-2 text-sm">
+        <span class="text-emerald-700 font-medium">Revisão confirmada:</span> {{ d.avaliacao }}
+      </div>
+      {% elif d.fase == "A revisar" %}
+      <form hx-post="/mural/devolucoes/{{ d.claim_id | urlencode }}/avaliar" hx-target="#devolucoes" hx-swap="innerHTML"
+            class="space-y-2">
+        <textarea name="observacao" required rows="2" placeholder="O que foi encontrado no produto?"
+                  class="w-full text-sm rounded-lg border border-slate-300 px-3 py-2"></textarea>
+        <button type="submit" class="block w-full text-center bg-amber-600 text-white rounded-lg py-2 text-sm font-medium hover:bg-amber-700">
+          Confirmar revisão
+        </button>
+      </form>
+      {% else %}
+      <span class="block w-full text-center bg-slate-100 text-slate-400 rounded-lg py-2 text-sm font-medium cursor-not-allowed">
+        Aguardando chegar — ainda "{{ d.fase or "Em preparação" }}"
+      </span>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>

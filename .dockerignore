@@ -1,0 +1,6 @@
+.env
+.env.example
+service_account.json
+__pycache__/
+*.pyc
+.git/

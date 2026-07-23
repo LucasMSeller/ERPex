@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Endereços — ERPex{% endblock %}
+{% block content %}
+<h1 class="text-xl font-semibold mb-6">Cadastro de endereçamento</h1>
+
+<div class="bg-white border border-slate-200 rounded-xl p-4 mb-8 max-w-2xl">
+  <h2 class="text-sm font-semibold mb-3">Novo SKU</h2>
+  <form class="flex flex-wrap items-end gap-3" hx-post="/enderecos" hx-include="#busca-enderecos"
+        hx-target="#enderecos-lista" hx-swap="innerHTML"
+        hx-indicator="#add-indicador" hx-disabled-elt="find button">
+    <div>
+      <label class="block text-xs text-slate-500 mb-1">SKU</label>
+      <input name="sku" required class="border border-slate-300 rounded-lg px-3 py-2 text-sm w-40">
+    </div>
+    <div>
+      <label class="block text-xs text-slate-500 mb-1">Corredor</label>
+      <input name="corredor" class="border border-slate-300 rounded-lg px-3 py-2 text-sm w-28">
+    </div>
+    <div>
+      <label class="block text-xs text-slate-500 mb-1">Estante</label>
+      <input name="estante" class="border border-slate-300 rounded-lg px-3 py-2 text-sm w-28">
+    </div>
+    <div>
+      <label class="block text-xs text-slate-500 mb-1">Prateleira</label>
+      <input name="prateleira" class="border border-slate-300 rounded-lg px-3 py-2 text-sm w-28">
+    </div>
+    <button type="submit" class="bg-slate-900 text-white rounded-lg px-4 py-2 text-sm font-medium hover:bg-slate-800 disabled:opacity-50">
+      Adicionar
+    </button>
+    <span id="add-indicador" class="htmx-indicator text-xs text-slate-500">Salvando…</span>
+  </form>
+</div>
+
+<div class="flex items-center gap-2 mb-4">
+  <input id="busca-enderecos" name="busca" type="text" placeholder="Buscar SKU..."
+         class="border border-slate-300 rounded-lg px-3 py-2 text-sm w-64 focus:outline-none focus:ring-2 focus:ring-slate-800">
+  <span id="busca-indicador" class="htmx-indicator text-xs text-slate-500">Buscando…</span>
+</div>
+
+<div id="enderecos-lista" hx-get="/enderecos/lista" hx-trigger="load, keyup changed delay:400ms from:#busca-enderecos"
+     hx-include="#busca-enderecos" hx-indicator="#busca-indicador" hx-swap="innerHTML">
+</div>
+{% endblock %}
