@@ -147,35 +147,3 @@ async def remove_mlb_addresses() -> int:
         return len(rows)
     finally:
         await conn.close()
-
-
-async def get_vinculo_status(lojas: list[str]) -> dict[str, dict]:
-    """Estado atual do botão "Vincular SKUs" pra cada loja (loja sem linha
-    ainda = nunca rodou, tratado como "ocioso" pelo chamador)."""
-    if not lojas:
-        return {}
-    conn = await _get_connection()
-    try:
-        rows = await conn.fetch(
-            "SELECT * FROM enderecos_vinculo_status WHERE loja = ANY($1::text[])", lojas,
-        )
-        return {r["loja"]: dict(r) for r in rows}
-    finally:
-        await conn.close()
-
-
-async def set_vinculo_status(loja: str, status: str, novos: int | None = None,
-                              removidos: int | None = None, total: int | None = None,
-                              erro: str | None = None) -> None:
-    conn = await _get_connection()
-    try:
-        await conn.execute(
-            """INSERT INTO enderecos_vinculo_status (loja, status, novos, removidos, total, erro, atualizado_em)
-               VALUES ($1, $2, $3, $4, $5, $6, now())
-               ON CONFLICT (loja) DO UPDATE SET
-                   status = EXCLUDED.status, novos = EXCLUDED.novos, removidos = EXCLUDED.removidos,
-                   total = EXCLUDED.total, erro = EXCLUDED.erro, atualizado_em = now()""",
-            loja, status, novos, removidos, total, erro,
-        )
-    finally:
-        await conn.close()
