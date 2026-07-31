@@ -10,16 +10,191 @@
                 focus:outline-none focus:ring-2 focus:ring-slate-800">
 </form>
 
+<div id="retirada-status" class="hidden mb-4 text-sm rounded-lg px-3 py-2 border max-w-md"></div>
+
 <div id="grid" data-poll hx-get="/gaiolas/estado" hx-trigger="load, poll-tick" hx-swap="innerHTML"></div>
+
+<div id="retirada-modal" class="hidden fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+  <div class="bg-white rounded-xl shadow-lg p-6 w-full max-w-sm">
+    <h2 class="text-lg font-semibold mb-1">Guia de retirada</h2>
+    <p id="retirada-modal-gaiola" class="text-sm text-slate-500 mb-4"></p>
+    <form id="retirada-form" class="space-y-3">
+      <label class="flex items-center gap-2 text-sm bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+        <input type="checkbox" name="motorista_interno" id="motorista-interno-check" class="rounded border-slate-300">
+        Retirada por funcionário interno (sem motorista externo)
+      </label>
+      <div id="campos-motorista" class="space-y-3">
+        <div>
+          <label class="block text-xs text-slate-600 mb-1">Nome do motorista</label>
+          <input name="motorista_nome" required
+                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-800">
+        </div>
+        <div>
+          <label class="block text-xs text-slate-600 mb-1">CPF</label>
+          <input name="motorista_cpf" required
+                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-800">
+        </div>
+        <div>
+          <label class="block text-xs text-slate-600 mb-1">Placa</label>
+          <input name="placa" required
+                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-800">
+        </div>
+        <div>
+          <label class="block text-xs text-slate-600 mb-1">Transportadora (opcional)</label>
+          <input name="transportadora"
+                 class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-800">
+        </div>
+      </div>
+      <div>
+        <label class="block text-xs text-slate-600 mb-1">Cópias</label>
+        <select name="copias" class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm">
+          <option value="1" selected>1 via</option>
+          <option value="2">2 vias</option>
+        </select>
+      </div>
+      <div class="flex items-center gap-2 pt-2">
+        <button type="submit" class="flex-1 bg-slate-900 text-white rounded-lg py-2 text-sm font-medium hover:bg-slate-800">
+          Imprimir e coletar
+        </button>
+        <button type="button" id="retirada-cancelar" class="px-4 py-2 text-sm text-slate-600 hover:text-slate-900">
+          Cancelar
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
+<script src="{{ cdn }}"></script>
 <script>
+  var CERT = {{ cert_js|safe }};
+  var PRINTER_GUIA = {{ printer_guia_js|safe }};
+
+  if (typeof qz !== 'undefined') {
+    qz.security.setCertificatePromise(function (resolve) { resolve(CERT); });
+    qz.security.setSignatureAlgorithm("SHA512");
+    qz.security.setSignaturePromise(function (toSign) {
+      return function (resolve, reject) {
+        fetch('/print/sign?request=' + encodeURIComponent(toSign))
+          .then(function (r) { return r.text(); }).then(resolve).catch(reject);
+      };
+    });
+  }
+
+  function conectarQZ() {
+    return qz.websocket.isActive() ? Promise.resolve() : qz.websocket.connect();
+  }
+
+  function getPrinter(nome) {
+    return nome ? qz.printers.find(nome) : qz.printers.getDefault();
+  }
+
+  function comoJson(r) {
+    var ct = r.headers.get('content-type') || '';
+    if (ct.indexOf('application/json') === -1) {
+      throw new Error('Sessão expirada — recarregue a página e faça login de novo.');
+    }
+    return r.json();
+  }
+
+  function mostrarStatus(msg, tipo) {
+    var el = document.getElementById('retirada-status');
+    el.textContent = msg;
+    el.className = 'mb-4 text-sm rounded-lg px-3 py-2 border max-w-md ' + (
+      tipo === 'erro' ? 'text-red-700 bg-red-50 border-red-200' :
+      tipo === 'ok' ? 'text-emerald-700 bg-emerald-50 border-emerald-200' :
+      'border-slate-200 bg-white text-slate-600'
+    );
+  }
+
   document.body.addEventListener('htmx:afterSwap', function (e) {
     if (e.target && e.target.id === 'grid') {
       var input = document.getElementById('bipar-input');
       if (input) { input.value = ''; input.focus(); }
     }
+  });
+
+  var gaiolaAtual = null;
+  var modal = document.getElementById('retirada-modal');
+  var form = document.getElementById('retirada-form');
+  var checkInterno = document.getElementById('motorista-interno-check');
+  var camposMotorista = document.getElementById('campos-motorista');
+
+  function aplicarInterno() {
+    var interno = checkInterno.checked;
+    camposMotorista.classList.toggle('hidden', interno);
+    camposMotorista.querySelectorAll('input:not([name="transportadora"])').forEach(function (input) {
+      input.required = !interno;
+    });
+  }
+  checkInterno.addEventListener('change', aplicarInterno);
+
+  document.getElementById('grid').addEventListener('click', function (e) {
+    var btn = e.target.closest('.coletar-btn');
+    if (!btn) return;
+    gaiolaAtual = btn.dataset.gaiola;
+    document.getElementById('retirada-modal-gaiola').textContent = gaiolaAtual;
+    form.reset();
+    aplicarInterno();
+    modal.classList.remove('hidden');
+  });
+
+  document.getElementById('retirada-cancelar').addEventListener('click', function () {
+    modal.classList.add('hidden');
+  });
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    if (!gaiolaAtual) return;
+    var dados = {
+      motorista_interno: checkInterno.checked,
+      motorista_nome: form.motorista_nome.value.trim(),
+      motorista_cpf: form.motorista_cpf.value.trim(),
+      placa: form.placa.value.trim(),
+      transportadora: form.transportadora.value.trim(),
+      copias: parseInt(form.copias.value, 10) || 1,
+    };
+    var submitBtn = form.querySelector('button[type="submit"]');
+    submitBtn.disabled = true;
+    mostrarStatus('Preparando guia…', '');
+
+    fetch('/gaiolas/' + encodeURIComponent(gaiolaAtual) + '/retirada/preparar', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(dados),
+    })
+      .then(comoJson)
+      .then(function (data) {
+        if (!data.ok) { throw new Error(data.msg); }
+        if (typeof qz === 'undefined') { throw new Error('QZ Tray não carregou (sem internet?).'); }
+        dados.romaneio_id = data.romaneio_id;
+        modal.classList.add('hidden');
+        mostrarStatus('Imprimindo romaneio ' + data.romaneio_id + ' (' + data.n_pacotes + ' pacote(s))…', '');
+        return conectarQZ()
+          .then(function () { return getPrinter(PRINTER_GUIA); })
+          .then(function (printer) {
+            var cfg = qz.configs.create(printer, { copies: dados.copias });
+            return qz.print(cfg, [{ type: 'pixel', format: 'html', data: data.html }]);
+          });
+      })
+      .then(function () {
+        return fetch('/gaiolas/' + encodeURIComponent(gaiolaAtual) + '/retirada/confirmar', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(dados),
+        });
+      })
+      .then(function (r) { return r.text(); })
+      .then(function (htmlGrid) {
+        document.getElementById('grid').innerHTML = htmlGrid;
+        mostrarStatus('Guia impressa e gaiola coletada.', 'ok');
+        gaiolaAtual = null;
+      })
+      .catch(function (err) {
+        mostrarStatus('Falha — nada foi coletado. ' + String(err.message || err), 'erro');
+      })
+      .finally(function () {
+        submitBtn.disabled = false;
+      });
   });
 </script>
 {% endblock %}

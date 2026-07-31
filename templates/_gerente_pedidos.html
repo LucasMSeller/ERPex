@@ -16,8 +16,10 @@
       <th class="px-3 py-2">Pedido (ML)</th>
       <th class="px-3 py-2">Empresa</th>
       <th class="px-3 py-2">ID Expedição</th>
+      <th class="px-3 py-2">Origem</th>
       <th class="px-3 py-2">Status</th>
       <th class="px-3 py-2">Impresso em</th>
+      <th class="px-3 py-2">Enviado em</th>
       <th class="px-3 py-2">Itens</th>
       <th class="px-3 py-2">Gaiola</th>
       <th class="px-3 py-2">Corrigir status</th>
@@ -27,90 +29,7 @@
   </thead>
   <tbody>
     {% for p in pedidos %}
-    <tr class="border-t border-slate-100">
-      <td class="px-3 py-2 font-mono">{{ p.venda }}</td>
-      <td class="px-3 py-2 font-mono text-slate-500">{{ p.order_id or "—" }}</td>
-      <td class="px-3 py-2">{{ p.empresa }}</td>
-      <td class="px-3 py-2 font-mono">{{ p.id_exped or "—" }}</td>
-      <td class="px-3 py-2">
-        {{ p.status }}
-        {% if p.status == "Cancelado" and p._cancelado_resolvido %}
-        <span class="ml-1 text-xs px-1.5 py-0.5 rounded-full bg-slate-200 text-slate-600">Finalizado</span>
-        {% endif %}
-      </td>
-      <td class="px-3 py-2 text-slate-500">{{ p.impresso_em or "—" }}</td>
-      <td class="px-3 py-2 text-slate-500">
-        {% for item in p.itens %}{{ item.sku }} (x{{ item.qtd }}){% if not loop.last %}, {% endif %}{% endfor %}
-      </td>
-      {% if p.status == "Devolução" %}
-      {% set dev = p._devolucao %}
-      <td class="px-3 py-2"><span class="text-slate-400 text-xs">—</span></td>
-      <td class="px-3 py-2">
-        {% if dev.status == "Finalizada" %}
-        <span class="text-xs px-2 py-0.5 rounded-full bg-slate-200 text-slate-600">Finalizada</span>
-        {% else %}
-        <div class="flex items-center gap-2 flex-wrap">
-          <span class="text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 whitespace-nowrap">
-            {{ dev.status_ml or "aberta" }}
-          </span>
-          <form hx-post="/gerente/pedidos/devolucao/{{ dev.claim_id | urlencode }}/finalizar"
-                hx-include="#filtros" hx-vals='{"pagina": {{ pagina | default(1) }}}'
-                hx-target="#gerente-pedidos" hx-swap="innerHTML">
-            <button type="submit" class="bg-slate-900 text-white rounded px-2 py-1 text-xs hover:bg-slate-800">Finalizar</button>
-          </form>
-        </div>
-        {% endif %}
-      </td>
-      <td class="px-3 py-2"><span class="text-slate-400 text-xs">—</span></td>
-      <td class="px-3 py-2"><span class="text-slate-400 text-xs">—</span></td>
-      {% else %}
-      <td class="px-3 py-2">
-        {% if p.gaiola and p.status|lower == "enviado" %}
-        <span class="text-slate-500 bg-slate-100 border border-slate-200 rounded px-2 py-0.5 text-xs whitespace-nowrap">
-          Armazenado — {{ p.gaiola }} (enviado)
-        </span>
-        {% elif p.gaiola %}
-        <div class="flex items-center gap-2">
-          <span class="text-emerald-700 bg-emerald-50 border border-emerald-200 rounded px-2 py-0.5 text-xs whitespace-nowrap">
-            Armazenado — {{ p.gaiola }}
-          </span>
-          <form hx-post="/gerente/pedidos/{{ p.venda | urlencode }}/remover-gaiola"
-                hx-include="#filtros" hx-vals='{"pagina": {{ pagina | default(1) }}}'
-                hx-target="#gerente-pedidos" hx-swap="innerHTML">
-            <button type="submit" class="text-red-600 hover:text-red-800 text-xs underline">Remover</button>
-          </form>
-        </div>
-        {% else %}
-        <span class="text-slate-400 text-xs">Não armazenado</span>
-        {% endif %}
-      </td>
-      <td class="px-3 py-2">
-        <form class="flex items-center gap-2" hx-post="/gerente/pedidos/{{ p.venda | urlencode }}/status"
-              hx-include="#filtros" hx-vals='{"pagina": {{ pagina | default(1) }}}'
-              hx-target="#gerente-pedidos" hx-swap="innerHTML">
-          <select name="novo_status" class="border border-slate-300 rounded px-2 py-1 text-xs">
-            {% for s in status_opcoes %}
-            <option value="{{ s }}" {% if s == p.status %}selected{% endif %}>{{ s }}</option>
-            {% endfor %}
-          </select>
-          <button type="submit" class="bg-slate-900 text-white rounded px-2 py-1 text-xs hover:bg-slate-800">Aplicar</button>
-        </form>
-      </td>
-      <td class="px-3 py-2">
-        <a class="text-slate-500 hover:text-slate-800 underline text-xs"
-           href="/print/baixar/{{ p.venda | urlencode }}?company={{ p.empresa | urlencode }}&exped={{ p.id_exped | urlencode }}">
-          Baixar
-        </a>
-      </td>
-      <td class="px-3 py-2">
-        <form hx-post="/gerente/pedidos/{{ p.venda | urlencode }}/emitir-nf"
-              hx-include="#filtros" hx-vals='{"pagina": {{ pagina | default(1) }}}'
-              hx-target="#gerente-pedidos" hx-swap="innerHTML">
-          <button type="submit" class="text-slate-500 hover:text-slate-800 underline text-xs">Emitir/consultar</button>
-        </form>
-      </td>
-      {% endif %}
-    </tr>
+    {% include "_gerente_pedido_linha.html" %}
     {% endfor %}
   </tbody>
 </table>

@@ -12,7 +12,122 @@
   {% endfor %}
 </div>
 
+<div id="print-status" class="hidden mb-4 text-sm rounded-lg px-3 py-2 border"></div>
+
 <div id="pedidos" data-poll hx-get="/mural/pedidos" hx-trigger="load, poll-tick, change from:#filtro-loja"
      hx-include="#filtro-loja" hx-swap="innerHTML">
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ cdn }}"></script>
+<script>
+(function() {
+  var CERT = {{ cert_js|safe }};
+
+  if (typeof qz !== 'undefined') {
+    qz.security.setCertificatePromise(function (resolve) { resolve(CERT); });
+    qz.security.setSignatureAlgorithm("SHA512");
+    qz.security.setSignaturePromise(function (toSign) {
+      return function (resolve, reject) {
+        fetch('/print/sign?request=' + encodeURIComponent(toSign))
+          .then(function (r) { return r.text(); }).then(resolve).catch(reject);
+      };
+    });
+  }
+
+  function conectarQZ() {
+    return qz.websocket.isActive() ? Promise.resolve() : qz.websocket.connect();
+  }
+
+  function imprimirZPL(zpl) {
+    return conectarQZ().then(function () { return qz.printers.getDefault(); })
+      .then(function (printer) {
+        return qz.print(qz.configs.create(printer), [{ type: 'raw', format: 'plain', data: zpl }]);
+      });
+  }
+
+  function comoJson(r) {
+    var ct = r.headers.get('content-type') || '';
+    if (ct.indexOf('application/json') === -1) {
+      throw new Error('Sessão expirada — recarregue a página e faça login de novo.');
+    }
+    return r.json();
+  }
+
+  function mostrarStatus(msg, tipo) {
+    var el = document.getElementById('print-status');
+    el.textContent = msg;
+    el.className = 'mb-4 text-sm rounded-lg px-3 py-2 border ' + (
+      tipo === 'erro' ? 'text-red-700 bg-red-50 border-red-200' :
+      tipo === 'ok' ? 'text-emerald-700 bg-emerald-50 border-emerald-200' :
+      'border-slate-200 bg-white text-slate-600'
+    );
+  }
+
+  // Imprime a etiqueta de separação DIRETO nesta página via QZ Tray, sem abrir
+  // aba/rota auxiliar — mesmo padrão da etiqueta do ML em /embalagem.
+  window.imprimirSeparacaoIndividual = function (venda, empresa, btn) {
+    if (typeof qz === 'undefined') { mostrarStatus('QZ Tray não carregou (sem internet?).', 'erro'); return; }
+    if (btn) { btn.disabled = true; btn.textContent = 'Imprimindo…'; }
+    mostrarStatus('Preparando etiqueta de ' + venda + '…', '');
+    fetch('/print/separacao/preparar', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ venda: venda, company: empresa }),
+    }).then(comoJson).then(function (data) {
+      if (!data.ok) throw new Error(data.msg);
+      mostrarStatus('Imprimindo etiqueta de ' + venda + '…', '');
+      return imprimirZPL(data.zpl).then(function () {
+        return fetch('/print/separacao/confirmar', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ venda: venda }),
+        }).then(comoJson);
+      }).then(function (conf) {
+        if (!conf.ok) throw new Error('Impresso, mas não consegui atualizar o status na planilha.');
+        mostrarStatus('Etiqueta de ' + venda + ' impressa.', 'ok');
+        htmx.trigger('#pedidos', 'poll-tick');
+      });
+    }).catch(function (err) {
+      mostrarStatus('Falha ao imprimir ' + venda + ': ' + String(err.message || err), 'erro');
+      if (btn) { btn.disabled = false; btn.textContent = 'Imprimir etiqueta de separação'; }
+    });
+  };
+
+  window.imprimirSeparacaoLote = function (vendas) {
+    if (typeof qz === 'undefined') { mostrarStatus('QZ Tray não carregou (sem internet?).', 'erro'); return; }
+    mostrarStatus('Preparando ' + vendas.length + ' etiqueta(s)…', '');
+    fetch('/print/separacao-lote/preparar', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ vendas: vendas }),
+    }).then(comoJson).then(function (data) {
+      if (!data.ok) throw new Error(data.msg);
+      mostrarStatus('Imprimindo ' + data.vendas.length + ' etiqueta(s)…' + (data.aviso ? ' ' + data.aviso : ''), '');
+      return imprimirZPL(data.zpl).then(function () {
+        return fetch('/print/separacao-lote/confirmar', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ vendas: data.vendas }),
+        }).then(comoJson);
+      }).then(function (conf) {
+        if (conf.falharam && conf.falharam.length) {
+          throw new Error('Impresso, mas ' + conf.falharam.length + ' pedido(s) NÃO avançaram pra Embalagem: '
+            + conf.falharam.join(', ') + '. Corrija manualmente no painel do Gerente.');
+        }
+        mostrarStatus(data.vendas.length + ' etiqueta(s) impressa(s).', 'ok');
+        htmx.trigger('#pedidos', 'poll-tick');
+      });
+    }).catch(function (err) {
+      mostrarStatus('Falha ao imprimir: ' + String(err.message || err), 'erro');
+    });
+  };
+
+  // Delegado no container persistente (#pedidos não é substituído pelo swap do
+  // htmx, só o conteúdo dentro dele) — funciona mesmo depois que os cards
+  // recarregam a cada poll, sem precisar reanexar listener por card.
+  document.getElementById('pedidos').addEventListener('click', function (e) {
+    var btn = e.target.closest('.separacao-print-btn');
+    if (!btn) return;
+    window.imprimirSeparacaoIndividual(btn.dataset.venda, btn.dataset.empresa, btn);
+  });
+})();
+</script>
 {% endblock %}

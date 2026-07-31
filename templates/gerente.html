@@ -26,12 +26,30 @@
     </select>
   </div>
 
+  <div class="flex flex-wrap items-center gap-4 mb-3">
+    <span class="text-slate-500 text-xs">Origem:</span>
+    {% for o in origem_opcoes %}
+    <label class="flex items-center gap-1.5">
+      <input type="checkbox" name="origem" value="{{ o }}" checked class="rounded border-slate-300">
+      {{ o }}
+    </label>
+    {% endfor %}
+  </div>
+
   <div class="flex items-center justify-between flex-wrap gap-4">
-    <div class="flex items-center gap-1">
-      <label class="text-slate-500 text-xs">De</label>
-      <input type="date" name="dia_de" class="border border-slate-300 rounded-lg px-2 py-1.5 text-sm">
-      <label class="text-slate-500 text-xs">até</label>
-      <input type="date" name="dia_ate" class="border border-slate-300 rounded-lg px-2 py-1.5 text-sm">
+    <div class="flex flex-wrap items-center gap-4">
+      <div class="flex items-center gap-1">
+        <label class="text-slate-500 text-xs">Data limite: de</label>
+        <input type="date" name="dia_de" class="border border-slate-300 rounded-lg px-2 py-1.5 text-sm">
+        <label class="text-slate-500 text-xs">até</label>
+        <input type="date" name="dia_ate" class="border border-slate-300 rounded-lg px-2 py-1.5 text-sm">
+      </div>
+      <div class="flex items-center gap-1">
+        <label class="text-slate-500 text-xs">Criado em: de</label>
+        <input type="date" name="dia_criado_de" class="border border-slate-300 rounded-lg px-2 py-1.5 text-sm">
+        <label class="text-slate-500 text-xs">até</label>
+        <input type="date" name="dia_criado_ate" class="border border-slate-300 rounded-lg px-2 py-1.5 text-sm">
+      </div>
     </div>
 
     <div class="flex items-center gap-3">
@@ -51,8 +69,10 @@
           <label class="flex items-center gap-2"><input type="checkbox" class="coluna-toggle rounded border-slate-300" data-col="pedido_ml"> Pedido (ML)</label>
           <label class="flex items-center gap-2"><input type="checkbox" class="coluna-toggle rounded border-slate-300" data-col="empresa"> Empresa</label>
           <label class="flex items-center gap-2"><input type="checkbox" class="coluna-toggle rounded border-slate-300" data-col="id_exped"> ID Expedição</label>
+          <label class="flex items-center gap-2"><input type="checkbox" class="coluna-toggle rounded border-slate-300" data-col="origem"> Origem</label>
           <label class="flex items-center gap-2"><input type="checkbox" class="coluna-toggle rounded border-slate-300" data-col="status"> Status</label>
           <label class="flex items-center gap-2"><input type="checkbox" class="coluna-toggle rounded border-slate-300" data-col="impresso_em"> Impresso em</label>
+          <label class="flex items-center gap-2"><input type="checkbox" class="coluna-toggle rounded border-slate-300" data-col="enviado_em"> Enviado em</label>
           <label class="flex items-center gap-2"><input type="checkbox" class="coluna-toggle rounded border-slate-300" data-col="itens"> Itens</label>
           <label class="flex items-center gap-2"><input type="checkbox" class="coluna-toggle rounded border-slate-300" data-col="gaiola"> Gaiola</label>
           <label class="flex items-center gap-2"><input type="checkbox" class="coluna-toggle rounded border-slate-300" data-col="corrigir_status"> Corrigir status</label>
@@ -70,7 +90,7 @@
 
 <script>
 (function() {
-  var COLUNAS = ['venda', 'pedido_ml', 'empresa', 'id_exped', 'status', 'impresso_em',
+  var COLUNAS = ['venda', 'pedido_ml', 'empresa', 'id_exped', 'origem', 'status', 'impresso_em', 'enviado_em',
                  'itens', 'gaiola', 'corrigir_status', 'etiqueta_ml'];
 
   function colunasVisiveis() {

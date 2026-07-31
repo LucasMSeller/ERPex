@@ -266,8 +266,7 @@
   document.getElementById('confirmar-ok').addEventListener('click', function() {
     var vendas = JSON.parse(document.getElementById('confirmar-modal').dataset.vendas || '[]');
     document.getElementById('confirmar-modal').classList.add('hidden');
-    var qs = vendas.map(function(v) { return 'venda=' + encodeURIComponent(v); }).join('&');
-    window.open('/print/separacao-lote?' + qs, '_blank');
+    window.imprimirSeparacaoLote(vendas);
     checks().forEach(function(c) { c.checked = false; });
     sessionStorage.removeItem('mural_selecionados');
     atualizarUI();

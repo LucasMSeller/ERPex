@@ -1,9 +1,10 @@
 """Rotas de manutenção pontual (rodadas manualmente via browser/curl)."""
 from fastapi import APIRouter, Query, HTTPException
-from services.sheets_service import SheetsService
+from services.sheets_service import SheetsService, VENDAS_DATA_START_ROW
 from services.token_store import TokenStore
 from services.meli_service import MeliService
 from services import enderecos_db
+from services import vendas_db
 from models.product import Product
 
 router = APIRouter(prefix="/debug", tags=["debug"])
@@ -12,7 +13,7 @@ router = APIRouter(prefix="/debug", tags=["debug"])
 @router.get("/sku/{mlb_id}")
 async def sku_sources(mlb_id: str, company: str = Query(...)):
     """Mostra ONDE está (ou não) o SKU de um anúncio — p/ achar SKU que cai no MLB."""
-    store = TokenStore().get_by_company(company)
+    store = await TokenStore().get_by_company(company)
     if not store:
         raise HTTPException(404, f"Loja '{company}' não conectada.")
     meli = MeliService(store, token_store=TokenStore())
@@ -43,18 +44,6 @@ async def sku_sources(mlb_id: str, company: str = Query(...)):
         "tem_variacoes": bool(body.get("variations")),
         "variacoes": variacoes,
     }
-
-
-@router.get("/apply-layout")
-async def apply_layout_now():
-    """Aplica o tema visual unificado às abas (Vendas, Endereçamento, Fiscal)."""
-    return SheetsService().apply_layout()
-
-
-@router.get("/dedupe-vendas")
-async def dedupe_vendas_now():
-    """Remove duplicatas da aba Vendas (mesmo order_id + SKU)."""
-    return {"linhas_apagadas": SheetsService().dedupe_vendas()}
 
 
 @router.get("/clean-enderecamento")
@@ -91,6 +80,47 @@ async def migrate_enderecos_now():
     }
 
 
+@router.get("/migrate-lojas")
+async def migrate_lojas_now():
+    """Migração pontual (Credenciais Firestore->Postgres): copia os tokens de
+    cada loja já conectada pra tabela `lojas`. Upsert (idempotente, pode rodar
+    de novo sem duplicar) — remover esta rota depois que a migração for
+    confirmada e as lojas continuarem funcionando 100% pelo Postgres."""
+    from google.cloud import firestore
+    from config.settings import get_settings
+
+    settings = get_settings()
+    kwargs = {"database": settings.firestore_database}
+    if settings.gcp_project:
+        kwargs["project"] = settings.gcp_project
+    if settings.google_service_account_json.endswith(".json"):
+        client = firestore.Client.from_service_account_json(settings.google_service_account_json, **kwargs)
+    else:
+        client = firestore.Client(**kwargs)
+    col = client.collection(settings.firestore_collection)
+
+    token_store = TokenStore()
+    migradas = []
+    for doc in col.stream():
+        s = doc.to_dict()
+        user_id = s.get("user_id") or doc.id
+        await token_store.save_store(
+            user_id=user_id,
+            company_key=s.get("company_key", ""),
+            sheet_tab=s.get("sheet_tab", ""),
+            access_token=s.get("access_token", ""),
+            refresh_token=s.get("refresh_token", ""),
+            nickname=s.get("nickname", ""),
+        )
+        if s.get("cor"):
+            await token_store.set_color(user_id, s["cor"])
+        if s.get("sku_prefixo"):
+            await token_store.set_sku_prefixo(user_id, s["sku_prefixo"])
+        migradas.append({"user_id": user_id, "company_key": s.get("company_key"), "nickname": s.get("nickname")})
+
+    return {"lojas_migradas": len(migradas), "detalhe": migradas}
+
+
 @router.get("/vincular-skus")
 async def vincular_skus_now(company: str | None = Query(None), sku_prefixo: str | None = Query(None)):
     """Reconcilia o Endereçamento com os SKUs reais atuais (mesma ação do botão
@@ -107,15 +137,265 @@ async def refresh_fiscal_now(company: str | None = Query(None)):
     return await refresh_pending_fiscal(company)
 
 
-@router.get("/backfill-venda-ml")
-async def backfill_venda_ml_now(company: str = Query(...)):
-    """Preenche a coluna Nº venda (ML) das vendas já existentes."""
-    from services.sync_service import backfill_venda_ml
-    return await backfill_venda_ml(company)
+def _corrigir_ids_numericos(rows: list[list], rows_raw: list[list]) -> list[list]:
+    """order_id (col G, índice 6) e Nº venda ML (col P, índice 15) podem ter sido
+    gravados em célula formatada como NÚMERO (não TEXTO) — a leitura formatada
+    (`_read`) então trunca IDs de 16 dígitos em notação científica
+    ("2,00002E+15"), colapsando vários pedidos DIFERENTES no mesmo valor
+    corrompido. Corrige usando a leitura SEM formatação (valor numérico exato —
+    float de 64 bits é exato pra 16 dígitos) nessas 2 colunas específicas."""
+    corrigidas = []
+    for r, r_raw in zip(rows, rows_raw):
+        p = list(r)
+        p_raw = list(r_raw)
+        for idx in (6, 15):
+            if idx < len(p_raw) and isinstance(p_raw[idx], (int, float)):
+                while len(p) <= idx:
+                    p.append("")
+                p[idx] = str(int(p_raw[idx]))
+        corrigidas.append(p)
+    return corrigidas
 
 
-@router.get("/backfill-expedicao")
-async def backfill_expedicao_now(company: str = Query(...)):
-    """Gera o ID de expedição das vendas já existentes que ainda não têm."""
-    from services.sync_service import backfill_expedition_ids
-    return await backfill_expedition_ids(company)
+@router.get("/migrate-vendas")
+async def migrate_vendas_now():
+    """Migração pontual (Vendas Sheets->Postgres): reconstrói vendas/venda_orders/
+    venda_itens a partir da aba Vendas crua. Só LÊ o Sheets, upsert idempotente no
+    Postgres — pode rodar de novo com segurança (ex.: logo antes/depois do deploy
+    do corte, pra pegar vendas que entraram na janela entre as 2 execuções)."""
+    sheets = SheetsService()
+    range_ = f"'Vendas'!A{VENDAS_DATA_START_ROW}:S"
+    rows = sheets._read(range_)
+    rows_raw = sheets._read_unformatted(range_)
+    rows = _corrigir_ids_numericos(rows, rows_raw)
+    limpeza = await vendas_db.purge_ids_corrompidos()
+    resultado = await vendas_db.bulk_migrate(rows)
+
+    pg_vendas = await vendas_db.count_vendas()
+    pg_orders = await vendas_db.count_orders()
+    pg_itens = await vendas_db.count_itens()
+
+    return {
+        **resultado,
+        "limpeza_ids_corrompidos": limpeza,
+        "postgres_vendas": pg_vendas, "postgres_orders": pg_orders, "postgres_itens": pg_itens,
+    }
+
+
+@router.get("/detect-full-orders")
+async def detect_full_orders_now():
+    """Migração pontual: os pedidos trazidos da aba Vendas nunca tiveram a origem
+    (Expedição/Full) rastreada — todos entraram com o padrão 'Expedição'. Esta
+    rota consulta o ML pra cada venda já registrada e corrige pra 'Full' quando o
+    envio é Mercado Envios Full (`logistic_type == "fulfillment"`). Idempotente
+    (só grava quando detecta Full de verdade) — pode rodar de novo com segurança."""
+    token_store = TokenStore()
+    pedidos = await vendas_db.get_all_pedidos()
+    meli_cache: dict[str, MeliService] = {}
+    marcados = []
+    erros = []
+    for p in pedidos:
+        if p["origem"] == "Full":
+            continue
+        empresa = p["empresa"]
+        meli = meli_cache.get(empresa)
+        if meli is None:
+            store = await token_store.get_by_company_or_nickname(empresa)
+            if not store:
+                erros.append({"venda": p["venda"], "erro": f"loja '{empresa}' não encontrada"})
+                continue
+            meli = MeliService(store, token_store=token_store)
+            meli_cache[empresa] = meli
+        try:
+            order, _shipping_id = await meli.resolve_order_and_shipping(p["venda"])
+            if await meli.is_full_order(order):
+                await vendas_db.set_origem(p["venda"], "Full")
+                marcados.append(p["venda"])
+        except Exception as e:
+            erros.append({"venda": p["venda"], "erro": str(e)})
+
+    return {"total_verificados": len(pedidos), "marcados_full": marcados, "erros": erros}
+
+
+@router.get("/shipment-info/{shipping_id}")
+async def shipment_info_now(shipping_id: str):
+    """Consulta pontual (só leitura): acha o order_id de um shipping_id (pra achar
+    o pedido nosso quando só temos o shipping_id, ex.: visto num log de erro)."""
+    token_store = TokenStore()
+    for s in await token_store.list_stores():
+        meli = MeliService(s, token_store=token_store)
+        try:
+            sh = await meli.get_shipment(shipping_id)
+        except Exception:
+            continue
+        order_id = str(sh.get("order_id") or "")
+        pedido = await vendas_db.get_pedido_by_order_id(order_id) if order_id else None
+        return {"empresa": s["company_key"], "order_id": order_id, "pedido": pedido,
+                "receiver_name": (sh.get("receiver_address") or {}).get("receiver_name")}
+    raise HTTPException(404, f"Shipping_id '{shipping_id}' não encontrado em nenhuma loja conectada.")
+
+
+@router.get("/investigar-envio/{numero}")
+async def investigar_envio_now(numero: str):
+    """Consulta pontual (só leitura, nada é gravado): junta o registro nosso
+    (Postgres) com order/shipment/SLA do ML pra investigar uma reclamação de
+    prazo/tamanho de entrega. `numero` aceita id_exped (ex. PLG300726001),
+    venda (pack_id) ou order_id — resolvido na mesma ordem que o painel usa."""
+    pedido = await vendas_db.get_pedido_by_exped(numero) or await vendas_db.get_pedido_by_venda(numero)
+    if not pedido:
+        pedido = await vendas_db.get_pedido_by_order_id(numero)
+
+    numero_ml = pedido["venda"] if pedido else numero
+    empresa = pedido["empresa"] if pedido else None
+
+    token_store = TokenStore()
+    store = None
+    if empresa:
+        store = await token_store.get_by_company_or_nickname(empresa)
+    if not store:
+        for s in await token_store.list_stores():
+            try:
+                meli = MeliService(s, token_store=token_store)
+                order, shipping_id = await meli.resolve_order_and_shipping(numero_ml)
+                store = s
+                break
+            except Exception:
+                continue
+        else:
+            raise HTTPException(404, f"Não achei o pedido '{numero}' em nenhuma loja conectada.")
+    else:
+        meli = MeliService(store, token_store=token_store)
+        order, shipping_id = await meli.resolve_order_and_shipping(numero_ml)
+
+    resultado = {
+        "nosso_registro": pedido,
+        "order": {
+            "id": order.get("id"),
+            "status": order.get("status"),
+            "date_created": order.get("date_created"),
+            "date_closed": order.get("date_closed"),
+            "pack_id": order.get("pack_id"),
+            "shipping_id": shipping_id,
+        },
+        "shipment": None,
+        "sla": None,
+        "history": None,
+    }
+    if shipping_id:
+        try:
+            resultado["shipment"] = await meli.get_shipment(shipping_id)
+        except Exception as e:
+            resultado["shipment_erro"] = str(e)
+        try:
+            resultado["sla"] = await meli._get(f"/shipments/{shipping_id}/sla")
+        except Exception as e:
+            resultado["sla_erro"] = str(e)
+        try:
+            resultado["history"] = await meli._get(f"/shipments/{shipping_id}/history")
+        except Exception as e:
+            resultado["history_erro"] = str(e)
+
+    order_id_str = str(order.get("id", ""))
+    from services import db as db_service
+    conn = await db_service._get_connection()
+    try:
+        cancelamento = await conn.fetchrow(
+            "SELECT * FROM cancelamentos WHERE order_id = $1 OR venda_ml = $2", order_id_str, numero_ml)
+        devolucao = await conn.fetchrow(
+            "SELECT * FROM devolucoes WHERE order_id = $1 OR venda_ml = $2", order_id_str, numero_ml)
+    finally:
+        await conn.close()
+    resultado["cancelamento_registrado"] = dict(cancelamento) if cancelamento else None
+    resultado["devolucao_registrada"] = dict(devolucao) if devolucao else None
+
+    try:
+        user_id = await meli.get_user_id()
+        resultado["claims_search"] = await meli._get(
+            "/post-purchase/v1/claims/search",
+            {"resource": "order", "resource_id": order_id_str, "player_id": user_id, "player_role": "respondent"},
+        )
+    except Exception as e:
+        resultado["claims_search_erro"] = str(e)
+    return resultado
+
+
+@router.get("/backfill-prazo-despacho")
+async def backfill_prazo_despacho_now():
+    """Migração pontual: até 2026-07-31, get_delivery_deadline() calculava o prazo
+    de despacho na hora da criação do pedido — quando o SLA do Mercado Envios
+    (/shipments/{id}/sla) costuma responder 404 (envio ainda não maduro pra
+    calcular), caindo no fallback (estimativa de ENTREGA ao comprador, semanas
+    depois) e gravando um `data_limite` errado. Corrigido daqui pra frente via
+    webhook 'shipments' (process_shipment_notification); esta rota corrige os
+    pedidos AINDA ABERTOS (Separando/Separado/Embalado) que já foram afetados —
+    pedidos Enviados não são tocados (prazo de despacho não importa mais neles).
+    Idempotente — pode rodar de novo com segurança."""
+    token_store = TokenStore()
+    pedidos = await vendas_db.get_all_pedidos(status_filter=["Separando", "Separado", "Embalado"])
+    meli_cache: dict[str, MeliService] = {}
+    corrigidos = []
+    sem_mudanca = 0
+    erros = []
+    for p in pedidos:
+        empresa = p["empresa"]
+        meli = meli_cache.get(empresa)
+        if meli is None:
+            store = await token_store.get_by_company_or_nickname(empresa)
+            if not store:
+                erros.append({"venda": p["venda"], "erro": f"loja '{empresa}' não encontrada"})
+                continue
+            meli = MeliService(store, token_store=token_store)
+            meli_cache[empresa] = meli
+        try:
+            order, shipping_id = await meli.resolve_order_and_shipping(p["venda"])
+            if not shipping_id:
+                erros.append({"venda": p["venda"], "erro": "pedido sem shipping_id"})
+                continue
+            deadline = await meli.get_delivery_deadline({"shipping": {"id": shipping_id}})
+            if not deadline or deadline == p["data_limite"]:
+                sem_mudanca += 1
+                continue
+            await vendas_db.set_data_limite(p["venda"], deadline)
+            corrigidos.append({"venda": p["venda"], "antigo": p["data_limite"], "novo": deadline})
+        except Exception as e:
+            erros.append({"venda": p["venda"], "erro": str(e)})
+
+    return {"total_verificados": len(pedidos), "corrigidos": corrigidos, "sem_mudanca": sem_mudanca, "erros": erros}
+
+
+@router.get("/backfill-criado-em")
+async def backfill_criado_em_now():
+    """Migração pontual: os pedidos trazidos da aba Vendas ganharam `criado_em`
+    igual ao horário da MIGRAÇÃO (não da venda de verdade — o Sheets nunca
+    guardou isso). Esta rota consulta o ML e corrige `criado_em` pra
+    `date_created` real de cada pedido, pro filtro "Criado em" do Gerente
+    funcionar também pra vendas antigas. Idempotente — pode rodar de novo."""
+    from datetime import datetime
+    token_store = TokenStore()
+    pedidos = await vendas_db.get_all_pedidos()
+    meli_cache: dict[str, MeliService] = {}
+    corrigidos = []
+    erros = []
+    for p in pedidos:
+        empresa = p["empresa"]
+        meli = meli_cache.get(empresa)
+        if meli is None:
+            store = await token_store.get_by_company_or_nickname(empresa)
+            if not store:
+                erros.append({"venda": p["venda"], "erro": f"loja '{empresa}' não encontrada"})
+                continue
+            meli = MeliService(store, token_store=token_store)
+            meli_cache[empresa] = meli
+        try:
+            order, _shipping_id = await meli.resolve_order_and_shipping(p["venda"])
+            date_created = order.get("date_created")
+            if not date_created:
+                erros.append({"venda": p["venda"], "erro": "pedido sem date_created"})
+                continue
+            criado_em = datetime.fromisoformat(date_created.replace("Z", "+00:00"))
+            await vendas_db.set_criado_em(p["venda"], criado_em)
+            corrigidos.append(p["venda"])
+        except Exception as e:
+            erros.append({"venda": p["venda"], "erro": str(e)})
+
+    return {"total_verificados": len(pedidos), "corrigidos": len(corrigidos), "erros": erros}

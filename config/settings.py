@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     # manda cada etiqueta pra sua impressora. Vazio = usa a impressora padrão do Windows.
     printer_pedido_name: str = ""
     printer_meli_name: str = ""
+    # Impressora comum (Wi-Fi, não térmica) usada pra guia de retirada de gaiola —
+    # documento de página inteira (HTML), não etiqueta ZPL.
+    printer_guia_name: str = ""
 
     # Cloud SQL (Postgres) — dados de notificação/cancelamento (services/db.py).
     # Não substitui o Sheets; é um banco à parte só pra esse tipo de dado.

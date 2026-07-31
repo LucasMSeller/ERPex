@@ -81,6 +81,19 @@ class SheetsService:
         )
         return result.get("values", [])
 
+    def _read_unformatted(self, range_: str) -> list[list]:
+        """Igual `_read`, mas com `valueRenderOption=UNFORMATTED_VALUE` — células
+        numéricas voltam como número de verdade (float), não a string já formatada
+        (que vem truncada em notação científica pra número NUMBER-formatado com
+        muitos dígitos, ex. "2,00002E+15" pra um order_id de 16 dígitos — ver
+        [[feedback_sheets_batch_writes]]/INCIDENTE 2026-07-20 na memória do
+        projeto). Usado só onde precisamos do valor exato (migração de Vendas)."""
+        result = self._execute_with_retry(
+            self._svc.values().get(spreadsheetId=self.sheet_id, range=range_,
+                                    valueRenderOption="UNFORMATTED_VALUE")
+        )
+        return result.get("values", [])
+
     def _append(self, range_: str, values: list[list]) -> None:
         self._throttle_escritas()
         self._execute_with_retry(self._svc.values().append(

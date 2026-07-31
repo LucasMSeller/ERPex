@@ -36,7 +36,7 @@ class OrderItem:
             ml_item = item.get("item", {})
             attributes = {a["id"]: a.get("value_name", "") for a in ml_item.get("attributes", [])}
             # No pedido, o SKU costuma vir em seller_sku / seller_custom_field
-            sku = (
+            sku = str(
                 ml_item.get("seller_sku")
                 or ml_item.get("seller_custom_field")
                 or attributes.get("SELLER_SKU")

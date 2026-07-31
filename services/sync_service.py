@@ -8,6 +8,7 @@ from services.sheets_service import SheetsService
 from services.token_store import TokenStore
 from services import db as db_service
 from services import enderecos_db
+from services import vendas_db
 
 logger = logging.getLogger(__name__)
 
@@ -21,17 +22,16 @@ def _sigla(store: dict) -> str:
     return (store.get("sigla") or _SIGLAS.get(ck) or ck[:3] or "LOJ").upper()
 
 
-def _expedition_id(store: dict, order: dict, sheets: SheetsService) -> str:
-    """Gera o ID de expedição da venda: sigla + DDMMAA (dia da venda) + sequencial."""
-    ddmmaa = _ddmmaa_br(order.get("date_created", "")) or datetime.now().strftime("%d%m%y")
-    return sheets.make_expedition_id(_sigla(store), ddmmaa)
-
-
 def _fiscal_cols(f: dict) -> list:
-    """Converte o dict de fiscal_summary nas 6 colunas J..O da aba Vendas."""
+    """Converte o dict de fiscal_summary nas 6 colunas fiscais (venda_orders).
+
+    Sempre em string — o ML às vezes devolve `nf_valor` como número, e as
+    colunas fiscais no Postgres são TEXT (asyncpg rejeita int onde espera str)."""
+    def _s(v):
+        return "" if v is None else str(v)
     return [
-        f.get("nf_numero_serie", ""), f.get("nf_valor", ""), f.get("nf_cfop", ""),
-        f.get("nf_chave", ""), f.get("comprador", ""), f.get("documento", ""),
+        _s(f.get("nf_numero_serie")), _s(f.get("nf_valor")), _s(f.get("nf_cfop")),
+        _s(f.get("nf_chave")), _s(f.get("comprador")), _s(f.get("documento")),
     ]
 
 
@@ -91,7 +91,7 @@ async def sync_all_products() -> list[dict]:
     sheets = SheetsService()
     token_store = TokenStore()
     results = []
-    for store in token_store.list_stores():
+    for store in await token_store.list_stores():
         results.append(await sync_products_for_store(store, sheets, token_store))
     return results
 
@@ -133,34 +133,33 @@ async def reconciliar_enderecos(company_key: str | None = None, sku_prefixo: str
     as lojas — seguro, porque compara contra a união de todo mundo."""
     token_store = TokenStore()
     if company_key:
-        store = token_store.get_by_company_or_nickname(company_key)
+        store = await token_store.get_by_company_or_nickname(company_key)
         skus = await _skus_reais_do_ml([store] if store else [], token_store)
         if sku_prefixo:
             return await enderecos_db.sync_skus(list(skus), sku_prefixo=sku_prefixo)
         novos = await enderecos_db.ensure_addresses_for_skus(list(skus))
         return {"novos": novos, "removidos": 0, "total": len(skus)}
 
-    skus = await _skus_reais_do_ml(token_store.list_stores(), token_store)
+    skus = await _skus_reais_do_ml(await token_store.list_stores(), token_store)
     return await enderecos_db.sync_skus(list(skus))
 
 
 async def sync_one_company(company_key: str) -> dict:
     token_store = TokenStore()
-    store = token_store.get_by_company(company_key) or token_store.get_by_company(company_key.upper())
+    store = await token_store.get_by_company(company_key) or await token_store.get_by_company(company_key.upper())
     if not store:
-        return {"company": company_key, "error": "loja não conectada (sem tokens no Firestore)"}
+        return {"company": company_key, "error": "loja não conectada"}
     return await sync_products_for_store(store, SheetsService(), token_store)
 
 
 async def backfill_orders_for_company(company_key: str, max_orders: int = 50) -> dict:
-    """Importa as vendas recentes de uma loja para a aba Vendas (ignora duplicatas)."""
+    """Importa as vendas recentes de uma loja (ignora duplicatas)."""
     token_store = TokenStore()
-    store = token_store.get_by_company(company_key)
+    store = await token_store.get_by_company(company_key)
     if not store:
         return {"company": company_key, "error": "loja não conectada"}
 
     meli = MeliService(store, token_store=token_store)
-    sheets = SheetsService()
     account_name = store.get("nickname", "")
 
     try:
@@ -169,8 +168,7 @@ async def backfill_orders_for_company(company_key: str, max_orders: int = 50) ->
         logger.error("Erro ao buscar pedidos de %s: %s", company_key, e)
         return {"company": company_key, "error": str(e)}
 
-    sheets.ensure_vendas_fiscal_columns()
-    existing = sheets.get_sale_order_ids()
+    existing = await vendas_db.get_sale_order_ids()
     addresses = await enderecos_db.get_addresses()
     new_orders = new_items = 0
 
@@ -181,14 +179,16 @@ async def backfill_orders_for_company(company_key: str, max_orders: int = 50) ->
         deadline = await meli.get_delivery_deadline(order)
         fiscal = _fiscal_cols(await meli.get_fiscal_summary(order))
         venda_ml = str(order.get("pack_id") or oid)   # nº que aparece no painel do ML
-        exped_id = _expedition_id(store, order, sheets)   # ID físico p/ etiqueta/gaiola
         items = OrderItem.from_meli_order(order, store["company_key"],
                                           account_name=account_name, deadline=deadline)
-        for item in items:
-            item.address = addresses.get(item.sku, "Sem endereço")
-            sheets.append_sale(
-                item.to_sheet_row() + [item.order_id, "Separando", ""] + fiscal
-                + [venda_ml, exped_id, ""])
+        empresa = items[0].to_sheet_row()[0] if items else (account_name or company_key)
+        ddmmaa = _ddmmaa_br(order.get("date_created", "")) or datetime.now().strftime("%d%m%y")
+        origem = "Full" if await meli.is_full_order(order) else "Expedição"
+        exped_id = await vendas_db.get_or_create_venda_and_expedition_id(
+            venda_ml, empresa, deadline, _sigla(store), ddmmaa, origem)
+        itens = [{"sku": item.sku, "nome": item.product_name, "qtd": item.quantity,
+                  "endereco": addresses.get(item.sku, "Sem endereço")} for item in items]
+        await vendas_db.registrar_pedido(venda_ml, oid, empresa, itens, fiscal)
         existing.add(oid)
         new_orders += 1
         new_items += len(items)
@@ -204,18 +204,18 @@ def _parse_ml_datetime(iso: str | None) -> datetime:
         return datetime.now(timezone.utc)
 
 
-async def _handle_cancelamento(sheets: SheetsService, company_key: str, order_id: str, order: dict) -> dict:
+async def _handle_cancelamento(company_key: str, order_id: str, order: dict) -> dict:
     """order.status == "cancelled" — só age se a venda já tiver virado um card real
-    na planilha (senão não há nada pra travar). Trava o Status (Sheets, mesmo
-    mecanismo de sempre) e registra o evento no Postgres pro painel de Notificações
-    do Gerente. Idempotente — webhooks de cancelamento podem chegar mais de uma vez."""
-    pedido = sheets.get_pedido_by_order_id(order_id)
+    (senão não há nada pra travar). Trava o Status e registra o evento no Postgres
+    pro painel de Notificações do Gerente. Idempotente — webhooks de cancelamento
+    podem chegar mais de uma vez."""
+    pedido = await vendas_db.get_pedido_by_order_id(order_id)
     if not pedido:
         return {"status": "cancelled_ignored", "order_id": order_id,
                 "detail": "pedido nunca chegou a ser processado — nada pra cancelar"}
 
     venda = pedido["venda"]
-    sheets.set_status_for_venda(venda, "Cancelado")
+    await vendas_db.set_status_for_venda(venda, "Cancelado")
 
     cancel_detail = order.get("cancel_detail") or {}
     motivo = cancel_detail.get("description") if isinstance(cancel_detail, dict) else None
@@ -235,7 +235,6 @@ async def process_order_notification(store: dict, order_id: str) -> dict:
     account_name = store.get("nickname", "")
     token_store = TokenStore()
     meli = MeliService(store, token_store=token_store)
-    sheets = SheetsService()
 
     try:
         order = await meli.get_order(order_id)
@@ -244,39 +243,72 @@ async def process_order_notification(store: dict, order_id: str) -> dict:
         return {"status": "error", "order_id": order_id, "detail": str(e)}
 
     # Checado ANTES dos dedups abaixo de propósito: um pedido cancelado pode já
-    # estar na planilha (Separando/Separado/Embalado) havia sido processado antes
-    # do cancelamento — o dedup existente ("already_processed"/"already_claimed")
-    # faria essa notificação nova ser ignorada e o cancelamento nunca apareceria.
+    # ter sido processado (Separando/Separado/Embalado) antes do cancelamento —
+    # o dedup existente ("already_processed"/"already_claimed") faria essa
+    # notificação nova ser ignorada e o cancelamento nunca apareceria.
     if order.get("status") == "cancelled":
-        return await _handle_cancelamento(sheets, company_key, order_id, order)
+        return await _handle_cancelamento(company_key, order_id, order)
 
-    # Dedup 1: linha já existe na aba Vendas (cobre pedidos antigos)
-    if order_id in sheets.get_sale_order_ids():
+    # Dedup 1: pedido já registrado (cobre pedidos antigos)
+    if order_id in await vendas_db.get_sale_order_ids():
         return {"status": "already_processed", "order_id": order_id}
-    # Dedup 2: reserva ATÔMICA no Firestore (à prova de webhooks concorrentes/reenvios)
-    if not token_store.claim_order(order_id):
+    # Dedup 2: reserva ATÔMICA no Postgres (à prova de webhooks concorrentes/reenvios)
+    if not await token_store.claim_order(order_id):
         return {"status": "already_claimed", "order_id": order_id}
 
     if order.get("status") not in ("paid", "payment_required"):
         return {"status": "skipped", "order_status": order.get("status")}
 
-    sheets.ensure_vendas_fiscal_columns()
     addresses = await enderecos_db.get_addresses()
     deadline = await meli.get_delivery_deadline(order)
     fiscal = _fiscal_cols(await meli.get_fiscal_summary(order))
     venda_ml = str(order.get("pack_id") or order_id)   # nº que aparece no painel do ML
-    exped_id = _expedition_id(store, order, sheets)    # ID físico p/ etiqueta/gaiola
     order_items = OrderItem.from_meli_order(order, company_key, account_name=account_name, deadline=deadline)
+    empresa = order_items[0].to_sheet_row()[0] if order_items else (account_name or company_key)
+    ddmmaa = _ddmmaa_br(order.get("date_created", "")) or datetime.now().strftime("%d%m%y")
+    origem = "Full" if await meli.is_full_order(order) else "Expedição"
+    exped_id = await vendas_db.get_or_create_venda_and_expedition_id(
+        venda_ml, empresa, deadline, _sigla(store), ddmmaa, origem)   # ID físico p/ etiqueta/gaiola
 
-    for item in order_items:
-        item.address = addresses.get(item.sku, "Sem endereço")
-        # A:R → ...F + G(order_id) + H(Status) + I(Estado) + J..O(fiscal)
-        #        + P(nº venda ML) + Q(ID Expedição) + R(Gaiola, vazio até embalar)
-        sheets.append_sale(item.to_sheet_row() + [item.order_id, "Separando", ""] + fiscal
-                           + [venda_ml, exped_id, ""])
+    itens = [{"sku": item.sku, "nome": item.product_name, "qtd": item.quantity,
+              "endereco": addresses.get(item.sku, "Sem endereço")} for item in order_items]
+    await vendas_db.registrar_pedido(venda_ml, order_id, empresa, itens, fiscal)
 
-    logger.info("[%s] Pedido %s → %d item(s) na aba Vendas", company_key, order_id, len(order_items))
+    logger.info("[%s] Pedido %s → %d item(s) registrado(s)", company_key, order_id, len(order_items))
     return {"status": "processed", "order_id": order_id, "items": len(order_items)}
+
+
+async def process_shipment_notification(store: dict, shipping_id: str) -> dict:
+    """Webhook topic 'shipments'. Na criação do pedido (process_order_notification),
+    o SLA de despacho (/shipments/{id}/sla) costuma responder 404 — o envio ainda não
+    amadureceu o suficiente pro Mercado Envios calcular o prazo — e `get_delivery_deadline`
+    cai no fallback (estimativa de ENTREGA ao comprador, semanas depois), gravando um prazo
+    de despacho errado em `vendas.data_limite`. Por essa altura (evento de shipment,
+    minutos depois) o SLA já costuma estar disponível; recalcula e corrige o campo com o
+    prazo de despacho de verdade — o que importa pro galpão, não a estimativa do comprador."""
+    meli = MeliService(store, token_store=TokenStore())
+    try:
+        sh = await meli.get_shipment(shipping_id)
+    except Exception as e:
+        return {"status": "error", "shipping_id": shipping_id, "detail": str(e)}
+
+    order_id = str(sh.get("order_id") or "")
+    if not order_id:
+        return {"status": "sem_order_id", "shipping_id": shipping_id}
+
+    pedido = await vendas_db.get_pedido_by_order_id(order_id)
+    if not pedido:
+        return {"status": "pedido_nao_encontrado", "shipping_id": shipping_id, "order_id": order_id}
+
+    deadline = await meli.get_delivery_deadline({"shipping": {"id": shipping_id}})
+    if not deadline or deadline == pedido["data_limite"]:
+        return {"status": "sem_mudanca", "venda": pedido["venda"], "data_limite": pedido["data_limite"]}
+
+    await vendas_db.set_data_limite(pedido["venda"], deadline)
+    logger.info("[%s] Venda %s: prazo de despacho corrigido %s -> %s",
+                store["company_key"], pedido["venda"], pedido["data_limite"], deadline)
+    return {"status": "corrigido", "venda": pedido["venda"], "data_limite_antigo": pedido["data_limite"],
+            "data_limite_novo": deadline}
 
 
 async def process_claim_notification(store: dict, claim_id: str) -> dict:
@@ -292,7 +324,6 @@ async def process_claim_notification(store: dict, claim_id: str) -> dict:
     company_key = store["company_key"]
     token_store = TokenStore()
     meli = MeliService(store, token_store=token_store)
-    sheets = SheetsService()
 
     try:
         claim = await meli.get_claim(claim_id)
@@ -301,11 +332,11 @@ async def process_claim_notification(store: dict, claim_id: str) -> dict:
         return {"status": "error", "claim_id": claim_id, "detail": str(e)}
 
     order_id = str(claim.get("resource_id") or "")
-    pedido = sheets.get_pedido_by_order_id(order_id) if order_id else None
+    pedido = await vendas_db.get_pedido_by_order_id(order_id) if order_id else None
     venda = pedido["venda"] if pedido else None
     # Empresa tem que bater com o valor real da coluna "Empresa" na planilha (o
-    # nickname da conta ML, ex.: "USER4_BRASIL") — não o company_key interno do
-    # Firestore (ex.: "User4"), senão vira um filtro "loja" duplicado/incoerente.
+    # nickname da conta ML, ex.: "USER4_BRASIL") — não o company_key interno
+    # (ex.: "User4"), senão vira um filtro "loja" duplicado/incoerente.
     empresa = pedido["empresa"] if pedido else (store.get("nickname") or company_key)
 
     reason_id = claim.get("reason_id")
@@ -360,7 +391,7 @@ async def send_fiscal_to_meli(company_key: str | None = None) -> dict:
     resultados: dict[int, list[str]] = defaultdict(list)   # row_num → ["✅ LOJA", "❌ LOJA: msg"]
 
     for loja, items in por_loja.items():
-        store = token_store.get_by_company(loja) or token_store.get_by_company(loja.upper())
+        store = await token_store.get_by_company(loja) or await token_store.get_by_company(loja.upper())
         if not store:
             for it in items:
                 resultados[it["row_num"]].append(f"❌ {loja}: não conectada")
@@ -387,80 +418,15 @@ async def send_fiscal_to_meli(company_key: str | None = None) -> dict:
     return {"enviados": enviados, "erros": erros, "ignorados": ignorados}
 
 
-async def backfill_venda_ml(company_key: str) -> dict:
-    """Preenche a coluna 'Nº venda (ML)' (pack/venda do painel) das vendas já existentes."""
-    token_store = TokenStore()
-    store = token_store.get_by_company(company_key) or token_store.get_by_company(company_key.upper())
-    if not store:
-        return {"company": company_key, "error": "loja não conectada"}
-    meli = MeliService(store, token_store=token_store)
-    sheets = SheetsService()
-
-    faltando = sheets.get_sale_order_ids_for_backfill()
-    if not faltando:
-        return {"preenchidos": 0, "faltando": 0}
-
-    mapa: dict[str, str] = {}
-    for oid in faltando:
-        try:
-            o = await meli.get_order(oid)
-            mapa[oid] = str(o.get("pack_id") or oid)
-        except Exception as e:
-            logger.warning("backfill_venda_ml: pedido %s falhou: %s", oid, e)
-    n = sheets.backfill_venda_ml(mapa) if mapa else 0
-    logger.info("backfill_venda_ml: %d preenchidos", n)
-    return {"preenchidos": n, "consultados": len(mapa)}
-
-
-async def backfill_expedition_ids(company_key: str) -> dict:
-    """Gera o ID de expedição das vendas já existentes que ainda não têm (col Q).
-
-    Agrupa por venda (pack): todos os SKUs da mesma venda recebem o MESMO ID.
-    Usa a data da venda (date_created do pedido) p/ o DDMMAA.
-    """
-    token_store = TokenStore()
-    store = token_store.get_by_company(company_key) or token_store.get_by_company(company_key.upper())
-    if not store:
-        return {"company": company_key, "error": "loja não conectada"}
-    meli = MeliService(store, token_store=token_store)
-    sheets = SheetsService()
-    sheets.ensure_vendas_fiscal_columns()
-
-    faltando = sheets.get_rows_missing_expedition()
-    if not faltando:
-        return {"vendas_preenchidas": 0, "linhas": 0}
-
-    grupos: dict[str, list[tuple[int, str]]] = defaultdict(list)   # venda -> [(row, order_id)]
-    for row_num, order_id, venda_ml in faltando:
-        grupos[venda_ml or order_id].append((row_num, order_id))
-
-    n = 0
-    for _key, lst in grupos.items():
-        order_id = lst[0][1]
-        try:
-            o = await meli.get_order(order_id)
-            ddmmaa = _ddmmaa_br(o.get("date_created", "")) or datetime.now().strftime("%d%m%y")
-        except Exception:
-            ddmmaa = datetime.now().strftime("%d%m%y")
-        exped = sheets.make_expedition_id(_sigla(store), ddmmaa)
-        sheets.set_expedition_id_for_rows([rn for rn, _ in lst], exped)
-        n += 1
-
-    logger.info("[%s] backfill_expedition_ids: %d vendas, %d linhas", company_key, n, len(faltando))
-    return {"vendas_preenchidas": n, "linhas": len(faltando)}
-
-
 async def refresh_pending_fiscal(company_key: str | None = None) -> dict:
     """Preenche a NF de vendas que ainda não tinham nota emitida na hora do pedido.
 
-    A NF do ML costuma sair minutos após a venda; este job varre a aba Vendas,
-    pega os pedidos sem chave de acesso (e não enviados) e tenta buscar a NF de novo.
+    A NF do ML costuma sair minutos após a venda; este job varre os pedidos sem
+    chave de acesso (e não enviados) e tenta buscar a NF de novo.
     """
     token_store = TokenStore()
-    sheets = SheetsService()
-    sheets.ensure_vendas_fiscal_columns()
 
-    pendentes = sheets.get_sales_needing_fiscal()
+    pendentes = await vendas_db.get_sales_needing_fiscal()
     if not pendentes:
         return {"pendentes": 0, "preenchidos": 0}
 
@@ -468,12 +434,12 @@ async def refresh_pending_fiscal(company_key: str | None = None) -> dict:
     meli_por_empresa: dict[str, MeliService] = {}
     preenchidos = 0
 
-    for _row_num, empresa, order_id in pendentes:
+    for empresa, order_id in pendentes:
         if company_key and empresa != company_key and empresa.upper() != company_key.upper():
             continue
         meli = meli_por_empresa.get(empresa)
         if meli is None:
-            store = token_store.get_by_company(empresa) or token_store.get_by_company(empresa.upper())
+            store = await token_store.get_by_company(empresa) or await token_store.get_by_company(empresa.upper())
             if not store:
                 continue
             meli = MeliService(store, token_store=token_store)
@@ -485,7 +451,7 @@ async def refresh_pending_fiscal(company_key: str | None = None) -> dict:
             logger.warning("refresh_fiscal: pedido %s falhou: %s", order_id, e)
             continue
         if fiscal.get("nf_chave") or fiscal.get("comprador"):
-            sheets.set_fiscal_for_order(order_id, _fiscal_cols(fiscal))
+            await vendas_db.set_fiscal_for_order(order_id, _fiscal_cols(fiscal))
             preenchidos += 1
 
     logger.info("refresh_fiscal: %d pendentes, %d preenchidos", len(pendentes), preenchidos)

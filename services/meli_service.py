@@ -63,7 +63,7 @@ def build_gaiola_zpl(exped_id: str) -> str:
     em teste real, 2026-07-21). Texto centralizado via ^FB (largura = a página
     toda); QR com magnificação maior (7) e X calculado pra ficar centralizado —
     o ID de expedição tem SEMPRE 12 caracteres (sigla 3 + DDMMAA 6 + sequencial
-    3, ver SheetsService.make_expedition_id), então cabe em QR versão 1 (21
+    3, ver vendas_db.get_or_create_venda_and_expedition_id), então cabe em QR versão 1 (21
     módulos) e a estimativa de tamanho usada aqui pra centralizar é estável.
     """
     eid = (exped_id or "").strip() or "SEM-ID"
@@ -216,8 +216,8 @@ def _parse_billing(billing: dict) -> tuple[str, str]:
 class MeliService:
     """Cliente da API do ML para UMA loja já autenticada.
 
-    `store` é o dict vindo do Firestore (user_id, access_token, refresh_token, ...).
-    Ao renovar o token, persiste de volta no Firestore via `token_store`.
+    `store` é o dict vindo do Postgres (tabela `lojas`: user_id, access_token,
+    refresh_token, ...). Ao renovar o token, persiste de volta via `token_store`.
     """
 
     def __init__(self, store: dict, token_store=None):
@@ -244,7 +244,7 @@ class MeliService:
             self._access_token = data["access_token"]
             self._refresh_token = data.get("refresh_token", self._refresh_token)
             if self.token_store and self.user_id:
-                self.token_store.update_tokens(self.user_id, self._access_token, self._refresh_token)
+                await self.token_store.update_tokens(self.user_id, self._access_token, self._refresh_token)
             return self._access_token
 
     async def _get(self, path: str, params: dict | None = None) -> dict:
@@ -473,6 +473,22 @@ class MeliService:
 
     async def get_shipment(self, shipping_id: str) -> dict:
         return await self._get(f"/shipments/{shipping_id}")
+
+    async def is_full_order(self, order: dict) -> bool:
+        """True quando o envio é Mercado Envios Full (`logistic_type ==
+        "fulfillment"`) — esses pedidos são separados/embalados pelo próprio
+        centro de distribuição do ML, nunca devem entrar no Mural/Embalagem/
+        Gaiolas do nosso galpão. Em caso de dúvida (sem shipping_id, ou erro na
+        consulta) assume que NÃO é Full — mais seguro tratar como nosso do que
+        esconder um pedido de verdade do fluxo físico."""
+        shipping_id = (order.get("shipping") or {}).get("id")
+        if not shipping_id:
+            return False
+        try:
+            sh = await self.get_shipment(str(shipping_id))
+        except Exception:
+            return False
+        return sh.get("logistic_type") == "fulfillment"
 
     async def get_label_zpl(self, shipping_id: str) -> str:
         """Retorna o ZPL da etiqueta de envio do ML (descompactado). Lança em erro."""

@@ -2,7 +2,7 @@ import hmac, hashlib, logging
 from fastapi import APIRouter, Request, HTTPException, Header, BackgroundTasks
 from config.settings import get_settings
 from services.token_store import TokenStore
-from services.sync_service import process_order_notification, process_claim_notification
+from services.sync_service import process_order_notification, process_claim_notification, process_shipment_notification
 
 router = APIRouter(prefix="/webhook", tags=["webhook"])
 logger = logging.getLogger(__name__)
@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 async def _process_notification(user_id: str, order_id: str) -> None:
     """Processa a notificação em background (o webhook já respondeu 200 ao ML)."""
-    store = TokenStore().get_store(user_id)
+    store = await TokenStore().get_store(user_id)
     if not store:
         logger.warning("user_id %s não encontrado no Firestore", user_id)
         return
@@ -21,9 +21,23 @@ async def _process_notification(user_id: str, order_id: str) -> None:
         logger.exception("Falha ao processar pedido %s: %s", order_id, e)
 
 
+async def _process_shipment(user_id: str, shipping_id: str) -> None:
+    """Processa a notificação de shipment em background — usada só pra corrigir
+    o prazo de despacho (SLA) quando ele não estava disponível na criação do pedido."""
+    store = await TokenStore().get_store(user_id)
+    if not store:
+        logger.warning("user_id %s não encontrado", user_id)
+        return
+    try:
+        result = await process_shipment_notification(store, shipping_id)
+        logger.info("Shipment %s processado: %s", shipping_id, result)
+    except Exception as e:
+        logger.exception("Falha ao processar shipment %s: %s", shipping_id, e)
+
+
 async def _process_claim(user_id: str, claim_id: str) -> None:
     """Processa a notificação de claim (devolução/reclamação) em background."""
-    store = TokenStore().get_store(user_id)
+    store = await TokenStore().get_store(user_id)
     if not store:
         logger.warning("user_id %s não encontrado no Firestore", user_id)
         return
@@ -62,6 +76,11 @@ async def ml_webhook(request: Request, background_tasks: BackgroundTasks,
         # (o ML reenvia a notificação se demorarmos a responder → causava duplicatas)
         background_tasks.add_task(_process_notification, user_id, order_id)
         return {"status": "accepted", "order_id": order_id}
+
+    if topic == "shipments":
+        shipping_id = resource.split("/")[-1]
+        background_tasks.add_task(_process_shipment, user_id, shipping_id)
+        return {"status": "accepted", "shipping_id": shipping_id}
 
     if topic == "claims":
         claim_id = resource.split("/")[-1]

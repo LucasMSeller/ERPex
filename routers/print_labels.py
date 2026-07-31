@@ -13,7 +13,7 @@ from fastapi.responses import Response, HTMLResponse
 from pydantic import BaseModel
 from services.token_store import TokenStore
 from services.meli_service import MeliService, build_qr_zpl, build_gaiola_zpl, build_separacao_zpl
-from services.sheets_service import SheetsService
+from services import vendas_db
 from services.qz_signing import QZ_CERT, sign as qz_sign
 from services.session_auth import require_login_or_gerente, require_gerente
 
@@ -34,8 +34,13 @@ class VendasIn(BaseModel):
     vendas: list[str]
 
 
+class PrepararSeparacaoIn(BaseModel):
+    venda: str
+    company: str
+
+
 async def _meli_for(company: str) -> MeliService:
-    store = TokenStore().get_by_company_or_nickname(company)
+    store = await TokenStore().get_by_company_or_nickname(company)
     if not store:
         raise HTTPException(404, f"Loja '{company}' não conectada.")
     return MeliService(store, token_store=TokenStore())
@@ -88,7 +93,7 @@ async def _montar_zpl(numero: str, company: str, exped: str) -> tuple[str, str, 
 
     if not exped:
         try:
-            exped = SheetsService().get_expedition_id(numero)
+            exped = await vendas_db.get_expedition_id(numero)
         except Exception:
             pass
     qr_zpl = build_qr_zpl(exped)
@@ -106,6 +111,12 @@ async def _montar_zpl_embalagem(pedido: dict, company: str) -> tuple[str, str, s
     dia) — nesse caso o chamador NÃO deve deixar embalar sem a etiqueta real. Quando
     não existe `shipping_id` (pedido sem envio associado no ML), `bloqueia=False`:
     esse é um cenário legítimo e diferente (nunca vai ter etiqueta do ML mesmo).
+
+    O gatilho de NF-e roda ANTES de buscar a etiqueta, de propósito: o ML só libera
+    a etiqueta depois que a nota está vinculada ao envio (senão o shipment fica em
+    "invoice_pending" e a busca vem 400/NOT_PRINTABLE_STATUS) — tentar emitir a nota
+    só DEPOIS de já ter falhado a etiqueta (como era antes) nunca dava chance da nota
+    sair, porque o bloqueio já tinha retornado antes de chegar nesse ponto.
     """
     exped_id = pedido.get("id_exped", "")
     zpl_pedido = build_gaiola_zpl(exped_id)
@@ -123,14 +134,25 @@ async def _montar_zpl_embalagem(pedido: dict, company: str) -> tuple[str, str, s
         bloqueia = True
     if order is not None:
         order_id = str(order.get("id", ""))
+    if order_id:
+        try:
+            resultado = await meli.ensure_invoice(order_id)
+            if resultado["erro"]:
+                aviso = (aviso + " " if aviso else "") + f"NF-e: erro ao emitir ({resultado['erro'][:120]})."
+            elif resultado["ja_existia"]:
+                aviso = (aviso + " " if aviso else "") + "NF-e já emitida anteriormente."
+            else:
+                aviso = (aviso + " " if aviso else "") + "NF-e emitida."
+        except Exception as e:
+            logger.warning("Gatilho NF-e (venda %s): falha inesperada — %s", pedido.get("venda"), e)
     if shipping_id:
         try:
             zpl_ml = await meli.get_label_zpl(shipping_id)
         except Exception as e:
-            aviso = f"Etiqueta do ML indisponível ainda (tente bipar de novo em alguns segundos): {str(e)[:120]}"
+            aviso = (aviso + " " if aviso else "") + f"Etiqueta do ML indisponível ainda (tente bipar de novo em alguns segundos): {str(e)[:120]}"
             bloqueia = True
     elif order is not None:
-        aviso = "Pedido sem envio associado — só a etiqueta do nosso ID será impressa."
+        aviso = (aviso + " " if aviso else "") + "Pedido sem envio associado — só a etiqueta do nosso ID será impressa."
     return zpl_pedido, zpl_ml, aviso, order_id, bloqueia
 
 
@@ -179,9 +201,9 @@ async def print_page(numero: str, company: str = Query(...), exped: str = Query(
 async def print_separacao_zpl(venda: str, company: str = Query(...)):
     """Baixa o .zpl da etiqueta de separação (sem imprimir nem confirmar nada) —
     padrão por enquanto, até as 2 impressoras reais estarem configuradas no galpão."""
-    pedido = SheetsService().get_pedido_by_venda(venda)
+    pedido = await vendas_db.get_pedido_by_venda(venda)
     if not pedido:
-        raise HTTPException(404, f"Pedido '{venda}' não encontrado na aba Vendas.")
+        raise HTTPException(404, f"Pedido '{venda}' não encontrado.")
     zpl = build_separacao_zpl(pedido)
     return Response(
         content=zpl, media_type="application/octet-stream",
@@ -189,52 +211,26 @@ async def print_separacao_zpl(venda: str, company: str = Query(...)):
                  "Cache-Control": "no-store"})
 
 
-@router.get("/separacao/{venda}")
-async def print_separacao_page(venda: str, background_tasks: BackgroundTasks, company: str = Query(...)):
-    """Página que imprime a etiqueta de expedição/separação (via QZ Tray) e, em
-    paralelo, já baixa o .zpl automaticamente — por enquanto (sem as 2 impressoras
-    reais configuradas), o download é o caminho confiável; a tentativa de impressão
-    via QZ Tray continua acontecendo e, quando as impressoras estiverem prontas,
-    passa a funcionar sem precisar mudar nada aqui.
-
-    Só depois que a impressão via QZ é confirmada com sucesso o Status vira "Separado"
-    (ver POST /print/separacao/confirmar, chamado pelo JS desta página) — é o que
-    libera o pedido para a etiqueta do ML na tela de Embalagem. Baixar o .zpl NÃO
-    confirma o status sozinho (evita marcar como impresso algo que não foi de verdade).
-    """
-    pedido = SheetsService().get_pedido_by_venda(venda)
+@router.post("/separacao/preparar")
+async def preparar_separacao(body: PrepararSeparacaoIn, background_tasks: BackgroundTasks):
+    """Monta o ZPL da etiqueta de separação pra impressão INLINE (Mural imprime
+    direto via QZ Tray na própria página, sem abrir aba/rota auxiliar — mesmo
+    padrão de /embalagem/validar). Nunca levanta em erro esperado (pedido não
+    encontrado/cancelado): devolve {"ok": False, "msg": ...} pro JS mostrar."""
+    pedido = await vendas_db.get_pedido_by_venda(body.venda)
     if not pedido:
-        raise HTTPException(404, f"Pedido '{venda}' não encontrado na aba Vendas.")
+        return {"ok": False, "msg": f'Pedido "{body.venda}" não encontrado.'}
     if pedido["status"].strip().lower() == "cancelado":
-        raise HTTPException(409, f"Pedido {venda} foi cancelado no Mercado Livre — não pode ser separado.")
+        return {"ok": False, "msg": f'Pedido {body.venda} foi cancelado no Mercado Livre — não pode ser separado.'}
 
     # Gatilho de NF-e: só faz sentido tentar se a entrega for hoje — antes disso o
     # ML ainda não libera a emissão (mesma regra que libera a etiqueta do ML).
     data_limite = _parse_data_br(pedido.get("data_limite"))
     if data_limite is not None and data_limite <= date.today():
-        background_tasks.add_task(_gatilho_nf, company, venda)
+        background_tasks.add_task(_gatilho_nf, body.company, body.venda)
 
     zpl = build_separacao_zpl(pedido)
-    confirmar_js = """
-    function confirmarSucesso() {
-      return fetch('/print/separacao/confirmar', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ venda: %s }),
-      }).then(function(r) {
-        if (!r.ok) throw new Error('Falha ao confirmar status (HTTP ' + r.status + ').');
-        return r.json();
-      }).then(function(data) {
-        if (!data.ok) throw new Error('Impresso, mas não consegui atualizar o status na planilha.');
-      });
-    }
-    """ % json.dumps(venda)
-    download_url = f"/print/separacao/zpl/{quote(venda)}?company={quote(company)}"
-    extra = f'<a class="btn sec" href="{download_url}">Baixar .zpl</a>'
-    html = _qz_print_page(
-        titulo=f"Etiqueta de separação — {venda}", zpl=zpl, extra_html=extra,
-        extra_success_js=confirmar_js, auto_download_url=download_url,
-    )
-    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+    return {"ok": True, "venda": body.venda, "zpl": zpl}
 
 
 @router.post("/separacao/confirmar")
@@ -242,28 +238,24 @@ async def confirmar_separacao(body: VendaIn):
     """Chamado pelo JS só depois que o QZ Tray confirma a impressão da etiqueta
     de separação com sucesso. Grava Status="Separado" + o horário da impressão."""
     agora = datetime.now().strftime("%d/%m/%Y %H:%M")
-    n = SheetsService().set_status_for_venda(body.venda, "Separado", impresso_em=agora)
+    n = await vendas_db.set_status_for_venda(body.venda, "Separado", impresso_em=agora)
     return {"ok": True, "linhas": n}
 
 
-@router.get("/separacao-lote")
-async def print_separacao_lote_page(venda: list[str] = Query(...)):
-    """Página de impressão em massa: concatena o ZPL de todas as vendas pedidas em
-    um job só (o QZ manda tudo pra impressora de uma vez; se ela não estiver pronta,
-    o download automático do .zpl combinado continua sendo o caminho confiável).
+@router.post("/separacao-lote/preparar")
+async def preparar_separacao_lote(body: VendasIn, background_tasks: BackgroundTasks):
+    """Mesma ideia de /separacao/preparar, mas monta um job combinado (1 ZPL só,
+    vários `^XA...^XZ` back-to-back) pra imprimir vários pedidos de uma vez, INLINE
+    no Mural — sem abrir aba/rota auxiliar.
 
-    Só confirma "Separado" (com o mesmo horário) pras vendas que realmente existiam
-    na aba — pedidos não encontrados (ex.: já avançaram de status por outra pessoa
-    entre a seleção e o clique) são ignorados e reportados no aviso, sem travar o
-    resto do lote.
-    """
-    vendas_pedidas = list(dict.fromkeys(v for v in venda if v))
+    Só reporta (aviso, não erro) pedidos não encontrados/cancelados — ex.: outra
+    pessoa já avançou o status entre a seleção e o clique — sem travar o resto do lote."""
+    vendas_pedidas = list(dict.fromkeys(v for v in body.vendas if v))
     pedidos = []
     faltando = []
     cancelados = []
-    svc = SheetsService()
     for v in vendas_pedidas:
-        pedido = svc.get_pedido_by_venda(v)
+        pedido = await vendas_db.get_pedido_by_venda(v)
         if not pedido:
             faltando.append(v)
         elif pedido["status"].strip().lower() == "cancelado":
@@ -271,7 +263,15 @@ async def print_separacao_lote_page(venda: list[str] = Query(...)):
         else:
             pedidos.append(pedido)
     if not pedidos:
-        raise HTTPException(404, "Nenhum dos pedidos selecionados foi encontrado na aba Vendas (ou todos estão cancelados).")
+        return {"ok": False, "msg": "Nenhum dos pedidos selecionados foi encontrado (ou todos estão cancelados)."}
+
+    # Mesmo gatilho de NF-e do print individual — faltava aqui, então pedido impresso
+    # em lote nunca tinha a nota disparada, e o ML trava a etiqueta ("invoice_pending")
+    # até a nota existir. Só dispara pros que já entram no dia de entrega.
+    for pedido in pedidos:
+        data_limite = _parse_data_br(pedido.get("data_limite"))
+        if data_limite is not None and data_limite <= date.today():
+            background_tasks.add_task(_gatilho_nf, pedido["empresa"], pedido["venda"])
 
     encontrados = [p["venda"] for p in pedidos]
     zpl = "\n".join(build_separacao_zpl(p) for p in pedidos)
@@ -281,41 +281,16 @@ async def print_separacao_lote_page(venda: list[str] = Query(...)):
     if cancelados:
         avisos.append(f"{len(cancelados)} pedido(s) cancelado(s) — não serão impressos: " + ", ".join(cancelados))
     aviso = " ".join(avisos)
-
-    confirmar_js = """
-    function confirmarSucesso() {
-      return fetch('/print/separacao-lote/confirmar', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ vendas: %s }),
-      }).then(function(r) {
-        if (!r.ok) throw new Error('Falha ao confirmar status (HTTP ' + r.status + ').');
-        return r.json();
-      }).then(function(data) {
-        if (data.falharam && data.falharam.length) {
-          throw new Error('Impresso, mas ' + data.falharam.length + ' pedido(s) NÃO avançaram pra Embalagem: '
-            + data.falharam.join(', ') + '. Corrija manualmente no painel do Gerente.');
-        }
-      });
-    }
-    """ % json.dumps(encontrados)
-    qs = "&".join(f"venda={quote(v)}" for v in encontrados)
-    download_url = f"/print/separacao-lote/zpl?{qs}"
-    extra = f'<a class="btn sec" href="{download_url}">Baixar .zpl</a>'
-    html = _qz_print_page(
-        titulo=f"Etiquetas de separação — {len(pedidos)} pedido(s)", zpl=zpl, aviso=aviso,
-        extra_html=extra, extra_success_js=confirmar_js, auto_download_url=download_url,
-    )
-    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+    return {"ok": True, "vendas": encontrados, "zpl": zpl, "aviso": aviso}
 
 
 @router.get("/separacao-lote/zpl")
 async def print_separacao_lote_zpl(venda: list[str] = Query(...)):
     """Baixa o .zpl combinado do lote (sem imprimir nem confirmar nada)."""
     vendas_pedidas = list(dict.fromkeys(v for v in venda if v))
-    svc = SheetsService()
-    pedidos = [p for p in (svc.get_pedido_by_venda(v) for v in vendas_pedidas) if p]
+    pedidos = [p for p in [await vendas_db.get_pedido_by_venda(v) for v in vendas_pedidas] if p]
     if not pedidos:
-        raise HTTPException(404, "Nenhum dos pedidos selecionados foi encontrado na aba Vendas.")
+        raise HTTPException(404, "Nenhum dos pedidos selecionados foi encontrado.")
     zpl = "\n".join(build_separacao_zpl(p) for p in pedidos)
     return Response(
         content=zpl, media_type="application/octet-stream",
@@ -336,18 +311,17 @@ async def confirmar_separacao_lote(body: VendasIn):
     da Embalagem, e ninguém era avisado. Agora o retorno lista exatamente quais
     vendas confirmaram e quais falharam, pro JS avisar e não fechar a aba sozinho."""
     agora = datetime.now().strftime("%d/%m/%Y %H:%M")
-    svc = SheetsService()
     confirmados: list[str] = []
     falharam: list[str] = []
     for v in body.vendas:
         ok = False
         for tentativa in range(2):
             try:
-                n = svc.set_status_for_venda(v, "Separado", impresso_em=agora)
+                n = await vendas_db.set_status_for_venda(v, "Separado", impresso_em=agora)
                 if n > 0:
                     ok = True
                 else:
-                    logger.warning("Confirmação em lote: venda '%s' não encontrada na aba Vendas.", v)
+                    logger.warning("Confirmação em lote: venda '%s' não encontrada.", v)
                 break
             except Exception:
                 if tentativa == 0:
@@ -366,8 +340,9 @@ async def sign_request(request: str = Query("")):
 def _qz_print_page(titulo: str, zpl: str, aviso: str = "", extra_html: str = "",
                     extra_success_js: str = "", auto_download_url: str = "") -> str:
     """Página HTML que conecta no QZ Tray, assina (evita prompt repetido) e imprime
-    o ZPL na impressora padrão do Windows assim que carrega. Reaproveitada por
-    /print/etiqueta e /print/separacao — qualquer página de "imprimir 1 ZPL na hora".
+    o ZPL na impressora padrão do Windows assim que carrega. Usada só por
+    /print/etiqueta hoje (fallback manual do Gerente) — a separação virou impressão
+    INLINE direto no Mural (ver templates/mural.html), sem página auxiliar.
 
     `extra_success_js`, se informado, deve definir uma função JS `confirmarSucesso()`
     que retorna uma Promise — chamada depois que a impressão dá certo e ANTES da aba

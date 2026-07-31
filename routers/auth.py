@@ -51,7 +51,7 @@ async def meli_callback(
     except Exception as e:
         raise HTTPException(500, f"Erro ao criar a aba da loja: {e}")
 
-    TokenStore().save_store(
+    await TokenStore().save_store(
         user_id=user_id,
         company_key=store_name,
         sheet_tab=store_name,

@@ -1,5 +1,8 @@
 {% if mensagem %}
-<div class="mb-3 text-sm text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2 max-w-2xl">{{ mensagem }}</div>
+<div class="mb-3 text-sm text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2 max-w-2xl flex items-center justify-between">
+  <span>{{ mensagem }}</span>
+  <button type="button" onclick="this.closest('div').remove()" class="text-emerald-700 hover:text-emerald-900 font-bold px-1">×</button>
+</div>
 {% endif %}
 {% if not grupos %}
 <p class="text-slate-400 text-sm">Nenhum SKU cadastrado ainda.</p>

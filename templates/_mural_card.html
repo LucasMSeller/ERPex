@@ -39,12 +39,11 @@
       Impressão bloqueada — pedido cancelado
     </span>
     {% else %}
-    <a
-      class="block w-full text-center bg-slate-900 text-white rounded-lg py-2 text-sm font-medium hover:bg-slate-800"
-      target="_blank"
-      href="/print/separacao/{{ p.venda | urlencode }}?company={{ p.empresa | urlencode }}">
+    <button type="button"
+      class="separacao-print-btn block w-full text-center bg-slate-900 text-white rounded-lg py-2 text-sm font-medium hover:bg-slate-800 disabled:opacity-60"
+      data-venda="{{ p.venda }}" data-empresa="{{ p.empresa }}">
       Imprimir etiqueta de separação
-    </a>
+    </button>
     {% endif %}
   </div>
 </div>

@@ -6,15 +6,17 @@ Dividido em aba "Hoje" (data limite hoje ou atrasada) e aba "Próximos envios", 
 por sua vez tem subabas: uma por dia (enquanto a data cair no mês atual) e uma por
 mês (a partir daí) — sempre ordenado da data mais próxima pra mais distante.
 """
+import json
 from datetime import date
 from fastapi import APIRouter, Request, Query, Form, Depends
 from templates_engine import templates
-from services.sheets_service import SheetsService
+from services import vendas_db
 from services.token_store import TokenStore
 from services.session_auth import require_login
+from services.qz_signing import QZ_CERT
 from services import db as db_service
 from services.meli_service import _BR_TZ
-from routers.print_labels import _meli_for
+from routers.print_labels import _meli_for, QZ_TRAY_CDN
 
 router = APIRouter(prefix="/mural", tags=["mural"], dependencies=[Depends(require_login)])
 
@@ -43,14 +45,17 @@ def _chave_ordenacao(p: dict) -> tuple:
 
 @router.get("")
 async def mural_page(request: Request):
-    pedidos = SheetsService().get_mural_pedidos()
+    pedidos = await vendas_db.get_mural_pedidos()
     empresas = sorted({p["empresa"] for p in pedidos if p["empresa"]})
-    return templates.TemplateResponse("mural.html", {"request": request, "empresas": empresas})
+    return templates.TemplateResponse("mural.html", {
+        "request": request, "empresas": empresas,
+        "cdn": QZ_TRAY_CDN, "cert_js": json.dumps(QZ_CERT),
+    })
 
 
 @router.get("/pedidos")
 async def mural_pedidos(request: Request, empresa: list[str] = Query([])):
-    pedidos = SheetsService().get_mural_pedidos()
+    pedidos = await vendas_db.get_mural_pedidos()
     if empresa:
         alvo = set(empresa)
         pedidos = [p for p in pedidos if p["empresa"] in alvo]
@@ -61,8 +66,16 @@ async def mural_pedidos(request: Request, empresa: list[str] = Query([])):
         arquivados = await db_service.listar_cancelados_arquivados()
     except Exception:
         arquivados = set()
+    # Some pedidos viram "Cancelado" no ML por causa de uma devolução concluída (reembolso
+    # total), não por cancelamento antes do envio — esses já têm card próprio na aba
+    # Devoluções, então tirar daqui evita mostrar o mesmo pedido 2x de forma confusa.
+    try:
+        com_devolucao = await db_service.listar_vendas_com_devolucao()
+    except Exception:
+        com_devolucao = set()
     pedidos = [p for p in pedidos
-               if not (p["status"].lower() == "cancelado" and p["venda"] in arquivados)]
+               if not (p["status"].lower() == "cancelado"
+                       and (p["venda"] in arquivados or p["venda"] in com_devolucao))]
 
     hoje = date.today()
     de_hoje: list[dict] = []
@@ -89,17 +102,16 @@ async def mural_pedidos(request: Request, empresa: list[str] = Query([])):
         for (ano, mes), pedidos_mes in sorted(por_mes.items())
     ]
 
-    cores = TokenStore().get_cores_por_empresa()
+    cores = await TokenStore().get_cores_por_empresa()
     return templates.TemplateResponse("_mural_pedidos.html", {
         "request": request, "hoje": de_hoje, "dias": dias, "meses": meses, "cores": cores,
     })
 
 
 async def _devolucoes_context(request: Request) -> dict:
-    sheets = SheetsService()
     devolucoes = await db_service.listar_devolucoes()
     for d in devolucoes:
-        pedido = sheets.get_pedido_by_venda(d["venda_ml"]) if d["venda_ml"] else None
+        pedido = await vendas_db.get_pedido_by_venda(d["venda_ml"]) if d["venda_ml"] else None
         d["itens"] = pedido["itens"] if pedido else []
         if d.get("criado_em"):
             d["criado_em"] = d["criado_em"].astimezone(_BR_TZ)

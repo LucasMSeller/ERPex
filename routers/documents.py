@@ -33,7 +33,7 @@ _PAGE = """<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
 
 
 async def _meli_for(company: str) -> MeliService:
-    store = TokenStore().get_by_company(company)
+    store = await TokenStore().get_by_company(company)
     if not store:
         raise HTTPException(404, f"Loja '{company}' não conectada.")
     return MeliService(store, token_store=TokenStore())
