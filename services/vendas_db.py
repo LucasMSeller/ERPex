@@ -9,9 +9,26 @@ ficam 1x por order_id (`venda_orders`), porque 1 venda pode combinar >1 order_id
 
 Mesmo estilo enxuto de services/db.py: sem pool/ORM, conexão nova por chamada.
 """
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from services.db import _get_connection
-from services.meli_service import _BR_TZ
+from services.meli_service import _BR_TZ, ORIGEM_INDEFINIDA
+
+# Por quanto tempo uma venda com a origem ainda indefinida fica escondida do Mural e do
+# Gerente — a ideia é só mostrar o que já foi decidido. Na prática o webhook de shipments
+# resolve em segundos. Passado o limite, ela VOLTA a aparecer (com aviso): não há job
+# periódico neste projeto pra resgatar nada, então esconder pra sempre significaria perder
+# o prazo de despacho de um pedido nosso sem ninguém ficar sabendo.
+JANELA_ORIGEM_INDEFINIDA = timedelta(minutes=30)
+
+
+def _aguardando_classificacao(p: dict) -> bool:
+    """True enquanto a origem do pedido ainda está sendo decidida e dentro da janela."""
+    if p.get("origem") != ORIGEM_INDEFINIDA:
+        return False
+    criado = p.get("criado_em")
+    if not criado:
+        return False
+    return datetime.now(timezone.utc) - criado < JANELA_ORIGEM_INDEFINIDA
 
 GAIOLAS = ["Gaiola 1", "Gaiola 2", "Gaiola 3", "Gaiola 4"]
 AGUARDANDO_BOX = "Aguardando box"
@@ -179,24 +196,33 @@ async def get_mural_pedidos() -> list[dict]:
     """Pedidos ainda não impressos (exclui Separado/Embalado/Enviado) — fila do mural.
 
     Exclui SEMPRE origem=="Full" — Mercado Envios Full é separado/embalado pelo
-    próprio ML, nunca deve aparecer pro nosso galpão bipar/imprimir."""
+    próprio ML, nunca deve aparecer pro nosso galpão bipar/imprimir. Esconde também
+    o que ainda está sendo classificado (ver `_aguardando_classificacao`): só entra
+    na fila o que já foi decidido."""
     pedidos = await _fetch_pedidos()
     return [p for p in pedidos.values()
             if p["status"].lower() not in ("separado", "embalado", "enviado")
-            and p["origem"] != "Full"]
+            and p["origem"] != "Full"
+            and not _aguardando_classificacao(p)]
 
 
 async def get_all_pedidos(status_filter: list[str] | None = None, busca: str = "",
                            loja: str = "", dia_de: str = "", dia_ate: str = "",
                            origem_filter: list[str] | None = None,
-                           dia_criado_de: str = "", dia_criado_ate: str = "") -> list[dict]:
+                           dia_criado_de: str = "", dia_criado_ate: str = "",
+                           incluir_em_classificacao: bool = False) -> list[dict]:
     """Todos os pedidos (qualquer status) — tela de auditoria do Gerente.
 
     `dia_de`/`dia_ate` filtram pela data-limite de despacho; `dia_criado_de`/
     `dia_criado_ate` filtram por quando a venda foi de fato registrada
     (`criado_em`) — datas diferentes, perguntas diferentes ("quando precisa
-    sair" vs "quando entrou")."""
-    pedidos = list((await _fetch_pedidos()).values())
+    sair" vs "quando entrou").
+
+    Assim como o Mural, esconde o que ainda está sendo classificado — o Gerente também
+    só vê o que já foi decidido (ver `_aguardando_classificacao`). As rotas de manutenção
+    passam `incluir_em_classificacao=True`: elas existem justamente pra resolver esses."""
+    pedidos = [p for p in (await _fetch_pedidos()).values()
+               if incluir_em_classificacao or not _aguardando_classificacao(p)]
     if status_filter:
         alvo = {s.strip().lower() for s in status_filter}
         pedidos = [p for p in pedidos if p["status"].strip().lower() in alvo]

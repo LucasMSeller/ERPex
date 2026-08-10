@@ -17,6 +17,10 @@
   <div class="px-4 py-2 bg-red-50 text-red-700 text-xs">
     Cancelado no Mercado Livre — travado até o Gerente finalizar em Notificações.
   </div>
+  {% elif p.origem == "Em análise" %}
+  <div class="px-4 py-2 bg-amber-50 text-amber-800 text-xs">
+    ⚠ Não deu pra confirmar se é Full — confira no Mercado Livre antes de separar.
+  </div>
   {% endif %}
   <div class="p-4 space-y-2">
     {% for item in p.itens %}

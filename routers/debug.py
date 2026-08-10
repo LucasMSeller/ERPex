@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Query, HTTPException
 from services.sheets_service import SheetsService, VENDAS_DATA_START_ROW
 from services.token_store import TokenStore
-from services.meli_service import MeliService
+from services.meli_service import MeliService, ORIGEM_FULL
 from services import enderecos_db
 from services import vendas_db
 from models.product import Product
@@ -184,19 +184,24 @@ async def migrate_vendas_now():
 
 @router.get("/detect-full-orders")
 async def detect_full_orders_now():
-    """Migração pontual: os pedidos trazidos da aba Vendas nunca tiveram a origem
-    (Expedição/Full) rastreada — todos entraram com o padrão 'Expedição'. Esta
-    rota consulta o ML pra cada venda já registrada e corrige pra 'Full' quando o
-    envio é Mercado Envios Full (`logistic_type == "fulfillment"`). Idempotente
-    (só grava quando detecta Full de verdade) — pode rodar de novo com segurança."""
+    """Rede de segurança manual da classificação de origem (Expedição/Full).
+
+    O caminho normal é automático: `detectar_origem` na criação do pedido e o webhook de
+    shipments reavaliando o que ficou 'Em análise'. Esta rota varre TODAS as vendas e
+    reclassifica de uma vez — útil pra corrigir registros antigos (os migrados do Sheets
+    entraram todos com o padrão 'Expedição') ou pra destravar algo que ficou 'Em análise'
+    porque os webhooks daquele pedido não vieram. Idempotente: só grava quando o ML
+    responde algo diferente do que está gravado, e nunca tira um pedido de 'Full'.
+    Aproveita a mesma consulta pra espelhar o envio dos Full já despachados pelo ML
+    (ver `sync_service.espelhar_envio_full`)."""
+    from services.sync_service import espelhar_envio_full
     token_store = TokenStore()
-    pedidos = await vendas_db.get_all_pedidos()
+    pedidos = await vendas_db.get_all_pedidos(incluir_em_classificacao=True)
     meli_cache: dict[str, MeliService] = {}
-    marcados = []
+    reclassificados = []
+    marcados_enviados = []
     erros = []
     for p in pedidos:
-        if p["origem"] == "Full":
-            continue
         empresa = p["empresa"]
         meli = meli_cache.get(empresa)
         if meli is None:
@@ -207,14 +212,23 @@ async def detect_full_orders_now():
             meli = MeliService(store, token_store=token_store)
             meli_cache[empresa] = meli
         try:
-            order, _shipping_id = await meli.resolve_order_and_shipping(p["venda"])
-            if await meli.is_full_order(order):
-                await vendas_db.set_origem(p["venda"], "Full")
-                marcados.append(p["venda"])
+            _order, shipping_id = await meli.resolve_order_and_shipping(p["venda"])
+            if not shipping_id:
+                # Sem envio atribuído não há como classificar; mantém o que está gravado.
+                continue
+            sh = await meli.get_shipment(shipping_id)
+            origem = meli.origem_do_shipment(sh)
+            if origem != p["origem"] and p["origem"] != ORIGEM_FULL:
+                await vendas_db.set_origem(p["venda"], origem)
+                reclassificados.append({"venda": p["venda"], "antes": p["origem"], "depois": origem})
+                p["origem"] = origem
+            if await espelhar_envio_full(p, sh, empresa):
+                marcados_enviados.append(p["venda"])
         except Exception as e:
             erros.append({"venda": p["venda"], "erro": str(e)})
 
-    return {"total_verificados": len(pedidos), "marcados_full": marcados, "erros": erros}
+    return {"total_verificados": len(pedidos), "reclassificados": reclassificados,
+            "marcados_enviados": marcados_enviados, "erros": erros}
 
 
 @router.get("/shipment-info/{shipping_id}")
@@ -331,7 +345,8 @@ async def backfill_prazo_despacho_now():
     pedidos Enviados não são tocados (prazo de despacho não importa mais neles).
     Idempotente — pode rodar de novo com segurança."""
     token_store = TokenStore()
-    pedidos = await vendas_db.get_all_pedidos(status_filter=["Separando", "Separado", "Embalado"])
+    pedidos = await vendas_db.get_all_pedidos(status_filter=["Separando", "Separado", "Embalado"],
+                                              incluir_em_classificacao=True)
     meli_cache: dict[str, MeliService] = {}
     corrigidos = []
     sem_mudanca = 0
@@ -372,7 +387,7 @@ async def backfill_criado_em_now():
     funcionar também pra vendas antigas. Idempotente — pode rodar de novo."""
     from datetime import datetime
     token_store = TokenStore()
-    pedidos = await vendas_db.get_all_pedidos()
+    pedidos = await vendas_db.get_all_pedidos(incluir_em_classificacao=True)
     meli_cache: dict[str, MeliService] = {}
     corrigidos = []
     erros = []

@@ -1,8 +1,11 @@
 import io
+import logging
 import zipfile
 from datetime import datetime, timezone, timedelta
 import httpx
 from config.settings import get_settings
+
+logger = logging.getLogger(__name__)
 
 MELI_API = "https://api.mercadolibre.com"
 MELI_AUTH = "https://auth.mercadolivre.com.br/authorization"
@@ -10,6 +13,18 @@ MELI_TOKEN_URL = f"{MELI_API}/oauth/token"
 
 # Brasil não usa horário de verão desde 2019 → offset fixo (evita depender de tzdata)
 _BR_TZ = timezone(timedelta(hours=-3))
+
+# O padrão do httpx é 5s, curto demais pra API do ML sob carga — em 05/08/2026 uma
+# consulta de shipment estourou esse limite e o pedido Full 2000014377469389 foi
+# classificado como "Expedição", vazando pro Mural (ver `detectar_origem`).
+_HTTP_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
+
+# Valores de `vendas.origem`. "Em análise" = ainda não deu pra saber (erro/timeout na
+# consulta do envio, ou envio ainda não atribuído) — NUNCA é um palpite: o webhook de
+# shipments reavalia e resolve depois (services/sync_service.process_shipment_notification).
+ORIGEM_EXPEDICAO = "Expedição"
+ORIGEM_FULL = "Full"
+ORIGEM_INDEFINIDA = "Em análise"
 
 
 def _fmt_date_br(iso: str) -> str:
@@ -248,7 +263,7 @@ class MeliService:
             return self._access_token
 
     async def _get(self, path: str, params: dict | None = None) -> dict:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
             resp = await client.get(f"{MELI_API}{path}", headers=self._headers(), params=params)
             if resp.status_code == 401:
                 await self.refresh_token()
@@ -474,21 +489,33 @@ class MeliService:
     async def get_shipment(self, shipping_id: str) -> dict:
         return await self._get(f"/shipments/{shipping_id}")
 
-    async def is_full_order(self, order: dict) -> bool:
-        """True quando o envio é Mercado Envios Full (`logistic_type ==
-        "fulfillment"`) — esses pedidos são separados/embalados pelo próprio
-        centro de distribuição do ML, nunca devem entrar no Mural/Embalagem/
-        Gaiolas do nosso galpão. Em caso de dúvida (sem shipping_id, ou erro na
-        consulta) assume que NÃO é Full — mais seguro tratar como nosso do que
-        esconder um pedido de verdade do fluxo físico."""
+    def origem_do_shipment(self, sh: dict) -> str:
+        """Classifica a origem a partir de um shipment JÁ buscado — sem chamada nova.
+        `logistic_type == "fulfillment"` é Mercado Envios Full: o próprio centro de
+        distribuição do ML separa, embala e despacha, então esses pedidos nunca podem
+        entrar no Mural/Embalagem/Gaiolas do nosso galpão."""
+        return ORIGEM_FULL if sh.get("logistic_type") == "fulfillment" else ORIGEM_EXPEDICAO
+
+    async def detectar_origem(self, order: dict) -> str:
+        """Origem do pedido: ORIGEM_FULL, ORIGEM_EXPEDICAO ou ORIGEM_INDEFINIDA.
+
+        Isto era `is_full_order() -> bool`, que devolvia False tanto pra "não é Full"
+        quanto pra "não consegui saber" — um palpite indistinguível de uma resposta.
+        Em 05/08/2026 a consulta do shipment estourou o timeout e o pedido Full
+        2000014377469389 foi gravado como Expedição, aparecendo no Mural sem que nada
+        depois o corrigisse. Agora a dúvida vira ORIGEM_INDEFINIDA e o webhook de
+        shipments a resolve minutos depois — nada é adivinhado."""
         shipping_id = (order.get("shipping") or {}).get("id")
         if not shipping_id:
-            return False
+            # Envio ainda não atribuído (webhook costuma chegar segundos após a venda).
+            return ORIGEM_INDEFINIDA
         try:
             sh = await self.get_shipment(str(shipping_id))
-        except Exception:
-            return False
-        return sh.get("logistic_type") == "fulfillment"
+        except Exception as e:
+            logger.warning("detectar_origem: shipment %s falhou (%s) — origem fica '%s'",
+                           shipping_id, e, ORIGEM_INDEFINIDA)
+            return ORIGEM_INDEFINIDA
+        return self.origem_do_shipment(sh)
 
     async def get_label_zpl(self, shipping_id: str) -> str:
         """Retorna o ZPL da etiqueta de envio do ML (descompactado). Lança em erro."""

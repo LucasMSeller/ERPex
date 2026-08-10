@@ -6,6 +6,8 @@
   <td class="px-3 py-2">
     {% if p.origem == "Full" %}
     <span class="text-xs px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-800">Full</span>
+    {% elif p.origem == "Em análise" %}
+    <span class="text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-800" title="Ainda não deu pra saber se é Full — o webhook de envio resolve em minutos.">Em análise</span>
     {% else %}
     <span class="text-xs text-slate-500">Expedição</span>
     {% endif %}

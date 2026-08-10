@@ -25,7 +25,12 @@ FILTRO_STATUS_OPCOES = STATUS_OPCOES + ["Devolução"]
 POR_PAGINA_OPCOES = [25, 50, 100, 0]   # 0 = "Todos"
 # 'Expedição' = nosso galpão separa/embala/expede; 'Full' = Mercado Envios Full
 # (o próprio ML cuida) — nunca aparece no Mural/Embalagem/Gaiolas, só aqui.
-ORIGEM_OPCOES = ["Expedição", "Full"]
+# 'Em análise' = classificação ainda não concluída. Não costuma aparecer: vendas nesse
+# estado ficam escondidas durante a janela de `vendas_db.JANELA_ORIGEM_INDEFINIDA`, e o
+# webhook de shipments resolve bem antes disso. Continua na lista porque, se alguma
+# escapar da janela, ela reaparece aqui — e sem a opção o filtro (que vem todo marcado
+# por padrão) esconderia de novo justo o pedido que precisa de atenção.
+ORIGEM_OPCOES = ["Expedição", "Full", "Em análise"]
 
 
 def _parse_data_br(valor: str) -> date | None:

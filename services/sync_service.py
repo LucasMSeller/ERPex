@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from collections import defaultdict
 from models.product import Product
 from models.order import OrderItem
-from services.meli_service import MeliService, _origem_code, _ddmmaa_br
+from services.meli_service import MeliService, _origem_code, _ddmmaa_br, ORIGEM_FULL
 from services.sheets_service import SheetsService
 from services.token_store import TokenStore
 from services import db as db_service
@@ -183,7 +183,7 @@ async def backfill_orders_for_company(company_key: str, max_orders: int = 50) ->
                                           account_name=account_name, deadline=deadline)
         empresa = items[0].to_sheet_row()[0] if items else (account_name or company_key)
         ddmmaa = _ddmmaa_br(order.get("date_created", "")) or datetime.now().strftime("%d%m%y")
-        origem = "Full" if await meli.is_full_order(order) else "Expedição"
+        origem = await meli.detectar_origem(order)
         exped_id = await vendas_db.get_or_create_venda_and_expedition_id(
             venda_ml, empresa, deadline, _sigla(store), ddmmaa, origem)
         itens = [{"sku": item.sku, "nome": item.product_name, "qtd": item.quantity,
@@ -266,7 +266,7 @@ async def process_order_notification(store: dict, order_id: str) -> dict:
     order_items = OrderItem.from_meli_order(order, company_key, account_name=account_name, deadline=deadline)
     empresa = order_items[0].to_sheet_row()[0] if order_items else (account_name or company_key)
     ddmmaa = _ddmmaa_br(order.get("date_created", "")) or datetime.now().strftime("%d%m%y")
-    origem = "Full" if await meli.is_full_order(order) else "Expedição"
+    origem = await meli.detectar_origem(order)
     exped_id = await vendas_db.get_or_create_venda_and_expedition_id(
         venda_ml, empresa, deadline, _sigla(store), ddmmaa, origem)   # ID físico p/ etiqueta/gaiola
 
@@ -278,14 +278,47 @@ async def process_order_notification(store: dict, order_id: str) -> dict:
     return {"status": "processed", "order_id": order_id, "items": len(order_items)}
 
 
+# Status do shipment que significam "o ML já tirou isso do CD dele".
+_SHIPMENT_DESPACHADO = ("shipped", "delivered")
+
+
+async def espelhar_envio_full(pedido: dict, sh: dict, company_key: str = "") -> bool:
+    """Marca um pedido Full como "Enviado" quando o ML já despachou.
+
+    Pedido Full não passa pelo nosso fluxo físico (separação/embalagem/gaiola), então
+    nada aqui dentro jamais mudaria o status dele — ficava "Separando" pra sempre na
+    auditoria do Gerente, mesmo com a mercadoria já a caminho. Quem despacha é o ML;
+    isto espelha esse fato. Idempotente e restrito a Full: pedido de Expedição só vira
+    "Enviado" pela coleta da gaiola ou pela correção manual, como sempre."""
+    if pedido.get("origem") != ORIGEM_FULL:
+        return False
+    if sh.get("status") not in _SHIPMENT_DESPACHADO:
+        return False
+    if (pedido.get("status") or "").strip().lower() == "enviado":
+        return False
+    await vendas_db.set_status_for_venda(pedido["venda"], "Enviado")
+    logger.info("[%s] Venda %s (Full): ML despachou (%s) -> status Enviado",
+                company_key, pedido["venda"], sh.get("status"))
+    return True
+
+
 async def process_shipment_notification(store: dict, shipping_id: str) -> dict:
-    """Webhook topic 'shipments'. Na criação do pedido (process_order_notification),
-    o SLA de despacho (/shipments/{id}/sla) costuma responder 404 — o envio ainda não
-    amadureceu o suficiente pro Mercado Envios calcular o prazo — e `get_delivery_deadline`
-    cai no fallback (estimativa de ENTREGA ao comprador, semanas depois), gravando um prazo
-    de despacho errado em `vendas.data_limite`. Por essa altura (evento de shipment,
-    minutos depois) o SLA já costuma estar disponível; recalcula e corrige o campo com o
-    prazo de despacho de verdade — o que importa pro galpão, não a estimativa do comprador."""
+    """Webhook topic 'shipments'. Corrige DUAS coisas que na criação do pedido
+    (process_order_notification) normalmente ainda não dá pra saber:
+
+    1. `data_limite` — o SLA de despacho (/shipments/{id}/sla) costuma responder 404 na
+       criação (o envio ainda não amadureceu o suficiente pro Mercado Envios calcular o
+       prazo) e `get_delivery_deadline` cai no fallback (estimativa de ENTREGA ao
+       comprador, semanas depois), gravando um prazo de despacho errado.
+    2. `origem` — quando a detecção de Full não concluiu, a venda ficou ORIGEM_INDEFINIDA
+       (ver `MeliService.detectar_origem`). O shipment já foi buscado logo acima, então a
+       reclassificação sai sem nenhuma chamada extra ao ML. Origem já resolvida como Full
+       nunca é reavaliada — isso não volta atrás.
+    3. `status` — pedido Full que o ML já despachou vira "Enviado" (ver
+       `espelhar_envio_full`), já que ele nunca passa pelo nosso fluxo físico.
+
+    O ML dispara vários eventos de shipment por pedido, então uma venda indefinida se
+    resolve sozinha em minutos. Idempotente."""
     meli = MeliService(store, token_store=TokenStore())
     try:
         sh = await meli.get_shipment(shipping_id)
@@ -300,15 +333,31 @@ async def process_shipment_notification(store: dict, shipping_id: str) -> dict:
     if not pedido:
         return {"status": "pedido_nao_encontrado", "shipping_id": shipping_id, "order_id": order_id}
 
-    deadline = await meli.get_delivery_deadline({"shipping": {"id": shipping_id}})
-    if not deadline or deadline == pedido["data_limite"]:
-        return {"status": "sem_mudanca", "venda": pedido["venda"], "data_limite": pedido["data_limite"]}
+    mudancas: dict = {}
+    origem_atual = pedido["origem"]
+    if origem_atual != ORIGEM_FULL:
+        origem_nova = meli.origem_do_shipment(sh)
+        if origem_nova != origem_atual:
+            await vendas_db.set_origem(pedido["venda"], origem_nova)
+            logger.info("[%s] Venda %s: origem %s -> %s",
+                        store["company_key"], pedido["venda"], origem_atual, origem_nova)
+            mudancas["origem"] = {"antes": origem_atual, "depois": origem_nova}
+            pedido["origem"] = origem_nova   # o dict foi lido antes do update
 
-    await vendas_db.set_data_limite(pedido["venda"], deadline)
-    logger.info("[%s] Venda %s: prazo de despacho corrigido %s -> %s",
-                store["company_key"], pedido["venda"], pedido["data_limite"], deadline)
-    return {"status": "corrigido", "venda": pedido["venda"], "data_limite_antigo": pedido["data_limite"],
-            "data_limite_novo": deadline}
+    if await espelhar_envio_full(pedido, sh, store["company_key"]):
+        mudancas["status"] = {"antes": pedido["status"], "depois": "Enviado"}
+
+    deadline = await meli.get_delivery_deadline({"shipping": {"id": shipping_id}})
+    if deadline and deadline != pedido["data_limite"]:
+        await vendas_db.set_data_limite(pedido["venda"], deadline)
+        logger.info("[%s] Venda %s: prazo de despacho corrigido %s -> %s",
+                    store["company_key"], pedido["venda"], pedido["data_limite"], deadline)
+        mudancas["data_limite"] = {"antes": pedido["data_limite"], "depois": deadline}
+
+    if not mudancas:
+        return {"status": "sem_mudanca", "venda": pedido["venda"],
+                "data_limite": pedido["data_limite"], "origem": origem_atual}
+    return {"status": "corrigido", "venda": pedido["venda"], **mudancas}
 
 
 async def process_claim_notification(store: dict, claim_id: str) -> dict:

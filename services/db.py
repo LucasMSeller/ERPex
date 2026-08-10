@@ -146,10 +146,12 @@ CREATE TABLE IF NOT EXISTS vendas (
     -- manual do Gerente) — em branco pros pedidos já enviados antes dessa
     -- coluna existir, não tem como recuperar isso retroativamente.
     enviado_em TEXT NOT NULL DEFAULT '',
-    -- 'Expedição' (nosso galpão separa/embala/expede) ou 'Full' (Mercado Envios
-    -- Full — o próprio ML separa/embala; nunca deve aparecer no Mural/Embalagem/
-    -- Gaiolas, só na auditoria do Gerente). Detectado 1x na criação via
-    -- MeliService.is_full_order (logistic_type do envio).
+    -- 'Expedição' (nosso galpão separa/embala/expede), 'Full' (Mercado Envios Full —
+    -- o próprio ML separa/embala; nunca deve aparecer no Mural/Embalagem/Gaiolas, só
+    -- na auditoria do Gerente) ou 'Em análise' (ainda não deu pra saber: envio não
+    -- atribuído ou erro na consulta do shipment). 'Em análise' é estado temporário,
+    -- NÃO um palpite — o webhook de shipments reavalia e resolve em minutos (ver
+    -- MeliService.detectar_origem e sync_service.process_shipment_notification).
     origem TEXT NOT NULL DEFAULT 'Expedição',
     criado_em TIMESTAMPTZ NOT NULL DEFAULT now(),
     atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now()
