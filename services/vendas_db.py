@@ -157,10 +157,17 @@ async def set_fiscal_for_order(order_id: str, fiscal_cols: list) -> int:
 
 # ── Mural / Gerente (leitura agrupada por venda) ─────────────────────────────
 
-async def _fetch_pedidos() -> dict[str, dict]:
-    """Todas as vendas com seus itens, agrupadas por venda — base compartilhada
-    por get_mural_pedidos/get_all_pedidos/get_pedido_by_venda/get_pedido_by_exped
+async def _fetch_pedidos(vendas: list[str] | None = None,
+                         exped: str | None = None) -> dict[str, dict]:
+    """Vendas com seus itens, agrupadas por venda — base compartilhada por
+    get_mural_pedidos/get_all_pedidos/get_pedido_by_venda/get_pedido_by_exped
     (mesmo papel que _agrupar_pedidos tinha no SheetsService).
+
+    `vendas`/`exped` restringem a busca NO BANCO. Sem eles a função varre a tabela
+    inteira, que é o certo pras telas de lista — mas era o que `get_pedido_by_venda`
+    fazia pra achar UM pedido, e o Gerente repetia isso uma vez por devolução: com 7
+    devoluções, 7 varreduras completas por clique (medido em 10/08/2026: até 8,8s
+    em /gerente/pedidos).
 
     Ordenado pelo próprio número da venda (decrescente), não por `criado_em`:
     os 111 pedidos trazidos da migração do Sheets todos ganharam o MESMO
@@ -177,7 +184,10 @@ async def _fetch_pedidos() -> dict[str, dict]:
                FROM vendas v
                JOIN venda_itens vi ON vi.venda = v.venda
                JOIN venda_orders vo ON vo.order_id = vi.order_id
-               ORDER BY (CASE WHEN v.venda ~ '^[0-9]+$' THEN v.venda::BIGINT ELSE 0 END) DESC, vi.id""")
+               WHERE ($1::text[] IS NULL OR v.venda = ANY($1::text[]))
+                 AND ($2::text IS NULL OR upper(v.id_exped) = $2)
+               ORDER BY (CASE WHEN v.venda ~ '^[0-9]+$' THEN v.venda::BIGINT ELSE 0 END) DESC, vi.id""",
+            vendas, exped)
     finally:
         await conn.close()
     pedidos: dict[str, dict] = {}
@@ -273,7 +283,105 @@ async def get_all_pedidos(status_filter: list[str] | None = None, busca: str = "
 
 
 async def get_pedido_by_venda(venda_key: str) -> dict | None:
-    return (await _fetch_pedidos()).get(venda_key)
+    return (await _fetch_pedidos(vendas=[venda_key])).get(venda_key)
+
+
+async def get_pedidos_por_venda(vendas: list[str]) -> dict[str, dict]:
+    """Vários pedidos de uma vez, em UMA consulta — para quem precisa resolver uma
+    lista (devoluções do Gerente, impressão de etiquetas em lote). Chamar
+    `get_pedido_by_venda` num laço custa uma ida ao banco por item."""
+    alvo = [v for v in dict.fromkeys(vendas) if v]
+    if not alvo:
+        return {}
+    return await _fetch_pedidos(vendas=alvo)
+
+
+async def listar_empresas() -> list[str]:
+    """Lojas distintas com venda registrada — base do dropdown de loja do Gerente.
+    DISTINCT no banco em vez de carregar todos os pedidos só pra extrair um campo;
+    e, ao contrário de derivar da lista já filtrada, continua devolvendo TODAS as
+    lojas (o dropdown não pode encolher conforme o filtro que ele mesmo alimenta)."""
+    conn = await _get_connection()
+    try:
+        rows = await conn.fetch(
+            "SELECT DISTINCT empresa FROM vendas WHERE empresa <> '' ORDER BY empresa")
+        return [r["empresa"] for r in rows]
+    finally:
+        await conn.close()
+
+
+async def marcar_enviado_na_data_limite(id_expeds: list[str], hora: str = "16:00") -> dict:
+    """Marca como Enviado usando a PRÓPRIA data-limite do pedido como data de despacho.
+
+    Existe por causa de um descompasso real: com o processo de gaiolas parado, os
+    pedidos são embalados e saem fisicamente, mas ninguém dá baixa — é a coleta da
+    gaiola que marcaria "Enviado". Eles ficavam "Embalado" e o painel os acusava como
+    atrasados. Aqui a data vem do próprio prazo (que é quando saíram de fato), não de
+    `now()`: carimbar com a hora de agora inventaria um despacho que não aconteceu hoje.
+
+    `hora` é informada por quem chama porque o horário exato não existe em lugar nenhum
+    — é uma aproximação declarada, não um dado medido. Só toca em pedido cuja
+    `data_limite` está no formato esperado; os demais voltam em `ignorados`."""
+    alvo = [i.strip().upper() for i in id_expeds if i and i.strip()]
+    if not alvo:
+        return {"marcados": [], "ignorados": []}
+    conn = await _get_connection()
+    try:
+        rows = await conn.fetch(
+            r"""UPDATE vendas
+                SET status = 'Enviado',
+                    enviado_em = data_limite || ' ' || $2,
+                    atualizado_em = now()
+                WHERE upper(id_exped) = ANY($1::text[])
+                  AND data_limite ~ '^\d{2}/\d{2}/\d{4}$'
+                RETURNING venda, id_exped, empresa, enviado_em""",
+            alvo, hora)
+    finally:
+        await conn.close()
+    marcados = {r["id_exped"].strip().upper() for r in rows}
+    return {
+        "marcados": [dict(r) for r in rows],
+        "ignorados": [i for i in alvo if i not in marcados],
+    }
+
+
+async def remover_vendas_por_exped(id_expeds: list[str]) -> dict:
+    """Apaga vendas inteiras (itens, orders e a venda) a partir do ID de expedição.
+
+    Existe pra desfazer importação indevida: em 10/08/2026 um backfill com `max=100`
+    trouxe vendas de maio a julho que já tinham sido entregues havia meses, e elas
+    caíram no topo do Mural (prazo vencido conta como urgente). Marcá-las como
+    enviadas gravaria `enviado_em` de hoje pra mercadoria entregue em maio — registro
+    falso; apagar é mais honesto.
+
+    NÃO mexe em `pedidos_processados`: o registro de dedup fica e serve de vacina —
+    se um webhook atrasado citar esses pedidos de novo, o sistema ignora em vez de
+    reimportar. Irreversível, e por isso recebe lista explícita, nunca um critério."""
+    alvo = [i.strip().upper() for i in id_expeds if i and i.strip()]
+    if not alvo:
+        return {"removidas": [], "nao_encontrados": [], "itens": 0, "orders": 0}
+    conn = await _get_connection()
+    try:
+        async with conn.transaction():
+            achadas = await conn.fetch(
+                """SELECT venda, id_exped, empresa, status, data_limite
+                   FROM vendas WHERE upper(id_exped) = ANY($1::text[])""", alvo)
+            vendas = [r["venda"] for r in achadas]
+            if not vendas:
+                return {"removidas": [], "nao_encontrados": alvo, "itens": 0, "orders": 0}
+            itens = await conn.fetch(
+                "DELETE FROM venda_itens WHERE venda = ANY($1::text[]) RETURNING id", vendas)
+            orders = await conn.fetch(
+                "DELETE FROM venda_orders WHERE venda = ANY($1::text[]) RETURNING order_id", vendas)
+            await conn.execute("DELETE FROM vendas WHERE venda = ANY($1::text[])", vendas)
+    finally:
+        await conn.close()
+    encontrados = {r["id_exped"].strip().upper() for r in achadas}
+    return {
+        "removidas": [dict(r) for r in achadas],
+        "nao_encontrados": [i for i in alvo if i not in encontrados],
+        "itens": len(itens), "orders": len(orders),
+    }
 
 
 async def get_pedido_by_order_id(order_id: str) -> dict | None:
@@ -291,11 +399,11 @@ async def get_pedido_by_order_id(order_id: str) -> dict | None:
 
 
 async def get_pedido_by_exped(exped_id: str) -> dict | None:
+    """Comparação case-insensitive — leitor de código de barras pode inverter caixa."""
     alvo = (exped_id or "").strip().upper()
-    for pedido in (await _fetch_pedidos()).values():
-        if pedido["id_exped"].strip().upper() == alvo:
-            return pedido
-    return None
+    if not alvo:
+        return None
+    return next(iter((await _fetch_pedidos(exped=alvo)).values()), None)
 
 
 async def set_criado_em(venda_key: str, criado_em: datetime) -> int:

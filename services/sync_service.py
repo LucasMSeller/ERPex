@@ -1,9 +1,13 @@
+import asyncio
 import logging
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from models.product import Product
 from models.order import OrderItem
-from services.meli_service import MeliService, _origem_code, _ddmmaa_br, ORIGEM_FULL
+from services.meli_service import (MeliService, _origem_code, _ddmmaa_br, ORIGEM_FULL,
+                                   fase_do_retorno, FASE_CHEGOU, FASE_DESCONHECIDA,
+                                   DESTINO_NOSSO, DESTINO_ML)
 from services.sheets_service import SheetsService
 from services.token_store import TokenStore
 from services import db as db_service
@@ -204,11 +208,19 @@ def _parse_ml_datetime(iso: str | None) -> datetime:
         return datetime.now(timezone.utc)
 
 
-async def _handle_cancelamento(company_key: str, order_id: str, order: dict) -> dict:
+async def _handle_cancelamento(company_key: str, order_id: str, order: dict,
+                               meli: "MeliService | None" = None) -> dict:
     """order.status == "cancelled" — só age se a venda já tiver virado um card real
     (senão não há nada pra travar). Trava o Status e registra o evento no Postgres
     pro painel de Notificações do Gerente. Idempotente — webhooks de cancelamento
-    podem chegar mais de uma vez."""
+    podem chegar mais de uma vez.
+
+    Nem todo "cancelled" do ML é cancelamento de verdade: quando o envio volta sem
+    ser entregue (`shipment.status == "not_delivered"`), a mercadoria SAIU e está
+    voltando — é devolução, não venda desfeita antes do despacho. Os dois casos
+    exigem tratamento físico diferente no galpão, então aqui eles são separados e o
+    retorno vira também um registro em `devolucoes` (visto em 11/08/2026 com a venda
+    2000017658785874, que aparecia como "Cancelado" sem nada cancelado no ML)."""
     pedido = await vendas_db.get_pedido_by_order_id(order_id)
     if not pedido:
         return {"status": "cancelled_ignored", "order_id": order_id,
@@ -226,8 +238,76 @@ async def _handle_cancelamento(company_key: str, order_id: str, order: dict) -> 
         logger.exception("Falha ao registrar cancelamento de %s no Postgres (Status já foi marcado "
                           "Cancelado no Sheets — só o registro de detalhe falhou).", venda)
 
-    logger.info("[%s] Pedido %s cancelado — Status=Cancelado.", company_key, order_id)
-    return {"status": "cancelled", "venda": venda, "order_id": order_id}
+    devolvido = await _registrar_retorno_como_devolucao(
+        company_key, venda, order_id, order, data_evento, motivo, meli)
+
+    logger.info("[%s] Pedido %s cancelado%s — Status=Cancelado.",
+                company_key, order_id, " (envio devolvido)" if devolvido else "")
+    return {"status": "devolvido_sem_entrega" if devolvido else "cancelled",
+            "venda": venda, "order_id": order_id}
+
+
+async def _registrar_retorno_como_devolucao(company_key: str, venda: str, order_id: str,
+                                            order: dict, data_evento, motivo: str | None,
+                                            meli: "MeliService | None") -> bool:
+    """Registra em `devolucoes` quando o cancelamento veio de envio não entregue.
+
+    Usa um `claim_id` sintético (`retorno-<order_id>`) porque não existe claim do ML
+    aqui — o UNIQUE dessa coluna é o que mantém a operação idempotente entre webhooks
+    repetidos. Falha aqui nunca derruba o cancelamento: o status da venda já foi
+    gravado antes, e perder o detalhe é menos grave que perder o travamento."""
+    shipping_id = (order.get("shipping") or {}).get("id")
+    if not shipping_id or meli is None:
+        return False
+    try:
+        sh = await meli.get_shipment(str(shipping_id))
+    except Exception as e:
+        logger.warning("Não deu pra checar se %s foi devolvido: %s", order_id, e)
+        return False
+    if sh.get("status") != "not_delivered":
+        return False
+    try:
+        await db_service.registrar_devolucao(
+            claim_id=f"retorno-{order_id}", venda_ml=venda, order_id=order_id,
+            empresa=company_key, tipo="retorno_sem_entrega", stage=sh.get("substatus"),
+            motivo=motivo or "Envio devolvido sem entrega", data_evento=data_evento,
+            raw={"shipment_status": sh.get("status"), "substatus": sh.get("substatus")},
+            status_ml="not_delivered",
+            # Guardado porque é por ele que a volta do pacote é acompanhada daqui em
+            # diante — sem isso, seria preciso buscar o pedido de novo só pra
+            # redescobrir o envio a cada consulta.
+            shipping_id=str(shipping_id),
+        )
+        await db_service.salvar_fase_devolucao(f"retorno-{order_id}", fase_do_retorno(sh))
+        return True
+    except Exception:
+        logger.exception("Falha ao registrar retorno de %s como devolução.", venda)
+        return False
+
+
+async def atualizar_fase_do_retorno(meli: "MeliService", shipping_id: str, sh: dict) -> dict | None:
+    """Reavalia a etapa de um retorno sem entrega a partir do envio. Devolve o que
+    mudou, ou None se este envio não pertence a nenhuma devolução.
+
+    Chamado pelo webhook de shipments: é assim que o card sai de "A caminho" para
+    "Chegou" sozinho. Antes nada reconsultava o envio depois do cancelamento — o
+    `not_delivered` era congelado no registro e a volta do pacote passava batida.
+
+    Recebe o `sh` que o chamador já buscou: é o mesmo envio, e buscar de novo seria
+    uma segunda ida ao ML em todo webhook."""
+    dev = await db_service.get_devolucao_por_shipping(str(shipping_id))
+    if not dev:
+        return None
+
+    fase = fase_do_retorno(sh)
+    if fase == dev.get("fase"):
+        return None
+    # A data real da volta só é buscada na transição pra "Chegou" — é uma chamada a
+    # mais no ML, e só nesse instante ela existe pra ser encontrada.
+    chegou_em = await meli.data_de_retorno(str(shipping_id)) if fase == FASE_CHEGOU else None
+    await db_service.salvar_fase_devolucao(dev["claim_id"], fase, chegou_em)
+    logger.info("Devolução %s: fase %s -> %s", dev["claim_id"], dev.get("fase"), fase)
+    return {"claim_id": dev["claim_id"], "antes": dev.get("fase"), "depois": fase}
 
 
 async def process_order_notification(store: dict, order_id: str) -> dict:
@@ -247,7 +327,7 @@ async def process_order_notification(store: dict, order_id: str) -> dict:
     # o dedup existente ("already_processed"/"already_claimed") faria essa
     # notificação nova ser ignorada e o cancelamento nunca apareceria.
     if order.get("status") == "cancelled":
-        return await _handle_cancelamento(company_key, order_id, order)
+        return await _handle_cancelamento(company_key, order_id, order, meli)
 
     # Dedup 1: pedido já registrado (cobre pedidos antigos)
     if order_id in await vendas_db.get_sale_order_ids():
@@ -302,6 +382,60 @@ async def espelhar_envio_full(pedido: dict, sh: dict, company_key: str = "") -> 
     return True
 
 
+async def conferir_vendas_recentes(horas: int = 3, importar: bool = True) -> dict:
+    """Confere se todo pedido pago recente do ML está registrado aqui, e importa o que
+    faltar. Rede de segurança para webhook que não chegou ou morreu no meio.
+
+    Compara IDs, nunca contagens. Contagem parece suficiente ("10 lá, 10 aqui, ok"),
+    mas erra justamente no caso ruim: falta uma venda nova e sobra um registro antigo,
+    o total bate e o pedido segue invisível. Foi o cenário de 10/08/2026. E comparar
+    um a um não custa nada a mais — a lista de IDs vem na MESMA chamada que daria a
+    contagem, então contar seria jogar fora informação já paga.
+
+    Não usa `backfill_orders_for_company`: aquele traz "as N vendas mais recentes da
+    loja", sem recorte de tempo, e foi o que arrastou vendas de maio pro Mural. Aqui o
+    corte é por `date_created`, então o que está fora da janela nunca entra.
+    """
+    token_store = TokenStore()
+    corte = datetime.now(timezone.utc) - timedelta(hours=horas)
+    registrados = await vendas_db.get_sale_order_ids()
+    lojas: list[dict] = []
+    recuperados: list[dict] = []
+
+    for store in await token_store.list_stores():
+        company_key = store["company_key"]
+        meli = MeliService(store, token_store=token_store)
+        try:
+            recentes = await meli.get_recent_orders(50)
+        except Exception as e:
+            lojas.append({"loja": company_key, "erro": str(e)})
+            continue
+
+        no_periodo = {str(o.get("id")) for o in recentes
+                      if _parse_ml_datetime(o.get("date_created")) >= corte}
+        faltando = sorted(no_periodo - registrados)
+        lojas.append({"loja": company_key, "no_ml": len(no_periodo),
+                      "faltando": faltando})
+
+        for order_id in faltando if importar else []:
+            # O webhook pode ter reservado o pedido e morrido antes de gravar; sem
+            # liberar, o próprio anti-duplicata bloquearia esta recuperação.
+            await token_store.liberar_order(order_id)
+            try:
+                r = await process_order_notification(store, order_id)
+            except Exception as e:
+                recuperados.append({"order_id": order_id, "loja": company_key, "erro": str(e)})
+                continue
+            recuperados.append({"order_id": order_id, "loja": company_key,
+                                "resultado": r.get("status")})
+            # Log em nível de alerta de propósito: se a rede de segurança começar a
+            # pescar peixe com frequência, o problema é o webhook, não a rede.
+            logger.warning("[%s] Conferência recuperou o pedido %s, que o webhook não "
+                           "registrou.", company_key, order_id)
+
+    return {"janela_horas": horas, "lojas": lojas, "recuperados": recuperados}
+
+
 async def process_shipment_notification(store: dict, shipping_id: str) -> dict:
     """Webhook topic 'shipments'. Corrige DUAS coisas que na criação do pedido
     (process_order_notification) normalmente ainda não dá pra saber:
@@ -325,15 +459,23 @@ async def process_shipment_notification(store: dict, shipping_id: str) -> dict:
     except Exception as e:
         return {"status": "error", "shipping_id": shipping_id, "detail": str(e)}
 
+    # Antes de tudo: este envio pode ser o de um pacote voltando. Fica aqui em cima
+    # porque a venda dele já foi cancelada, e as correções abaixo (prazo, origem)
+    # não se aplicam mais — mas a volta do pacote precisa ser acompanhada.
+    retorno = await atualizar_fase_do_retorno(meli, shipping_id, sh)
+
     order_id = str(sh.get("order_id") or "")
     if not order_id:
-        return {"status": "sem_order_id", "shipping_id": shipping_id}
+        return {"status": "sem_order_id", "shipping_id": shipping_id, "retorno": retorno}
 
     pedido = await vendas_db.get_pedido_by_order_id(order_id)
     if not pedido:
-        return {"status": "pedido_nao_encontrado", "shipping_id": shipping_id, "order_id": order_id}
+        return {"status": "pedido_nao_encontrado", "shipping_id": shipping_id,
+                "order_id": order_id, "retorno": retorno}
 
     mudancas: dict = {}
+    if retorno:
+        mudancas["devolucao"] = retorno
     origem_atual = pedido["origem"]
     if origem_atual != ORIGEM_FULL:
         origem_nova = meli.origem_do_shipment(sh)
@@ -361,14 +503,26 @@ async def process_shipment_notification(store: dict, shipping_id: str) -> dict:
 
 
 async def process_claim_notification(store: dict, claim_id: str) -> dict:
-    """Fase 1 (2026-07-22): registra QUALQUER claim recebido em `devolucoes` (Postgres),
-    sem alterar o Status na aba Vendas — a venda já está "Enviado" a essa altura, e uma
-    devolução não deve reabrir o fluxo de separação/embalagem. Guarda o payload bruto
-    (`raw`) porque a Claims API não está 100% documentada/verificada ainda; o filtro por
-    tipo/estágio (ex.: só devolução física, não mediação genérica) fica pra depois, quando
-    tivermos um caso real pra confirmar o formato.
+    """Registra em `devolucoes` (Postgres) o claim que tem PACOTE VOLTANDO, e só ele.
 
-    Idempotente — o ML pode reenviar o mesmo webhook mais de uma vez (claim_id é UNIQUE).
+    Não mexe no Status da venda: a essa altura ela já está "Enviado", e uma devolução
+    não deve reabrir o fluxo de separação/embalagem. O `raw` guarda o payload inteiro
+    porque a Claims API muda sem aviso.
+
+    O filtro (2026-08-19): `post_purchase` cobre reclamação, mediação, pergunta
+    pós-venda e troca — coisa que não tem pacote nenhum voltando pro galpão. Até aqui
+    o código gravava QUALQUER claim, adiado até existir um caso real ("o filtro fica
+    pra depois"); o caso apareceu. Registrar tudo encheria a aba Devoluções de
+    reclamação sem devolução, e devolução tem que ser tratada como devolução,
+    cancelamento como cancelamento.
+
+    O critério é o que a doc do ML manda usar: `related_entities` contendo "return"
+    significa que existe devolução associada à reclamação. Quem não tem é ignorado —
+    e sem prejuízo, porque o ML notifica o mesmo claim várias vezes (o 5562216393
+    disparou 12 notificações): quando a devolução nascer, a próxima notificação já
+    traz "return" e o registro acontece ali.
+
+    Idempotente — o ML reenvia o mesmo webhook mais de uma vez (claim_id é UNIQUE).
     """
     company_key = store["company_key"]
     token_store = TokenStore()
@@ -380,7 +534,37 @@ async def process_claim_notification(store: dict, claim_id: str) -> dict:
         logger.error("Erro ao buscar claim %s: %s", claim_id, e)
         return {"status": "error", "claim_id": claim_id, "detail": str(e)}
 
-    order_id = str(claim.get("resource_id") or "")
+    entidades = [str(e).lower() for e in (claim.get("related_entities") or [])]
+    if "return" not in entidades:
+        # `related_entities` ESVAZIA quando a devolução encerra — medido em 21/08/2026
+        # no claim 5562216393: no dia 20 vinha ["return"], no dia seguinte veio []. Um
+        # claim notificado só depois do encerramento seria descartado como "sem
+        # devolução", e o pacote (que continua vindo pro galpão) nunca teria card.
+        # Por isso o campo vazio não decide sozinho: pergunta direto ao recurso de
+        # devoluções, que é a fonte real. Só nesse caso, então não custa nada no
+        # caminho normal.
+        try:
+            confirmacao = await meli.get_return_detail(claim_id)
+        except Exception:
+            confirmacao = None
+        if isinstance(confirmacao, list):
+            confirmacao = confirmacao[0] if confirmacao else None
+        if not (confirmacao or {}).get("id"):
+            logger.info("[%s] Claim %s ignorado: sem devolução associada (related_entities=%s).",
+                        company_key, claim_id, entidades or "vazio")
+            return {"status": "sem_devolucao", "claim_id": claim_id, "related_entities": entidades}
+        logger.info("[%s] Claim %s: related_entities vazio, mas o ML tem a devolução %s.",
+                    company_key, claim_id, confirmacao.get("id"))
+
+    # `resource_id` só é um pedido quando `resource` diz que é. A doc lista outros
+    # valores (claim, shipment, other) e, num claim desses, usar o id como order_id
+    # buscaria um pedido que não existe: a devolução entrava órfã, sem venda, sem
+    # itens e com a loja errada — sem erro nenhum na tela.
+    recurso = (claim.get("resource") or "").strip().lower()
+    order_id = str(claim.get("resource_id") or "") if recurso in ("", "order") else ""
+    if recurso not in ("", "order"):
+        logger.warning("[%s] Claim %s aponta pra '%s', não pra um pedido — registrando sem venda.",
+                       company_key, claim_id, recurso)
     pedido = await vendas_db.get_pedido_by_order_id(order_id) if order_id else None
     venda = pedido["venda"] if pedido else None
     # Empresa tem que bater com o valor real da coluna "Empresa" na planilha (o
@@ -397,18 +581,29 @@ async def process_claim_notification(store: dict, claim_id: str) -> dict:
         motivo = f"{motivo} (resolvido a favor de: {beneficiados or '—'})"
     data_evento = _parse_ml_datetime(claim.get("date_created"))
 
+    # O envio de volta só existe depois que o ML o cria, então nas primeiras
+    # notificações isso vem vazio — e o COALESCE do upsert garante que uma consulta
+    # vazia não apague o que uma notificação posterior já tiver gravado.
+    estado = await meli.estado_da_devolucao(claim_id)
+
     try:
         await db_service.registrar_devolucao(
             claim_id=claim_id, venda_ml=venda, order_id=order_id or None, empresa=empresa,
             tipo=claim.get("type"), stage=claim.get("stage"), motivo=motivo,
             data_evento=data_evento, raw=claim, status_ml=claim.get("status"),
+            destino=estado.get("destino"), return_id=estado.get("return_id"),
         )
+        if estado["fase"] != FASE_DESCONHECIDA:
+            await db_service.salvar_fase_devolucao(claim_id, estado["fase"])
     except Exception:
         logger.exception("Falha ao registrar devolução (claim %s) no Postgres.", claim_id)
         return {"status": "error", "claim_id": claim_id, "detail": "falha ao gravar no Postgres"}
 
-    logger.info("[%s] Claim %s registrado (order_id=%s, venda=%s).", company_key, claim_id, order_id, venda)
-    return {"status": "registered", "claim_id": claim_id, "order_id": order_id, "venda": venda}
+    logger.info("[%s] Claim %s registrado (order_id=%s, venda=%s, destino=%s, fase=%s).",
+                company_key, claim_id, order_id, venda, estado.get("destino"), estado["fase"])
+    return {"status": "registered", "claim_id": claim_id, "order_id": order_id, "venda": venda,
+            "destino": estado.get("destino"), "return_id": estado.get("return_id"),
+            "fase": estado["fase"]}
 
 
 async def send_fiscal_to_meli(company_key: str | None = None) -> dict:
@@ -505,3 +700,85 @@ async def refresh_pending_fiscal(company_key: str | None = None) -> dict:
 
     logger.info("refresh_fiscal: %d pendentes, %d preenchidos", len(pendentes), preenchidos)
     return {"pendentes": len(pendentes), "preenchidos": preenchidos}
+
+
+# ── Prazo de despacho: perguntar em vez de esperar ────────────────────────────
+# O webhook 'shipments' do ML é push por evento: ele avisa quando o ENVIO muda de
+# estado, não quando o SLA passa a existir. Um pedido pode ficar horas sem prazo
+# sem que nada seja notificado — a venda 2000014601305665 (19/08/2026) só se
+# corrigiu quando alguém emitiu a NF-e pelo site do ML, e foi essa ação, não o
+# tempo, que acordou o ML. Como não há nada nosso perguntando de tempos em tempos
+# (o projeto não tem scheduler), o prazo dependia de uma pessoa agir primeiro.
+#
+# Esta função é a pergunta que faltava, pendurada no poll que o Mural já faz a
+# cada ~15s enquanto o galpão trabalha: a instância do Cloud Run já está de pé,
+# então não custa cold start nem free tier — só as chamadas ao ML, e apenas pros
+# pedidos que ainda não têm prazo. Sem Cloud Scheduler, sem sleep, sem coluna
+# nova: `data_limite` vazio JÁ é o marcador de "o ML ainda não disse".
+_ULTIMA_TENTATIVA: dict[str, float] = {}   # venda -> time.monotonic() da última pergunta
+_INTERVALO_TENTATIVA = 90.0   # não pergunta a mesma venda mais que 1x a cada 90s
+_MAX_POR_RODADA = 3           # teto por poll, pra não virar rajada contra o ML
+_LOCK_PRAZOS = asyncio.Lock()
+
+
+def _esquecer_tentativas_antigas(agora: float) -> None:
+    """`_ULTIMA_TENTATIVA` só cresce enquanto vendas entram e saem do Mural; sem isto
+    ele viraria um vazamento lento de memória numa instância de vida longa."""
+    if len(_ULTIMA_TENTATIVA) <= 500:
+        return
+    velhas = [v for v, t in _ULTIMA_TENTATIVA.items() if agora - t > 3600]
+    for v in velhas:
+        _ULTIMA_TENTATIVA.pop(v, None)
+
+
+async def revalidar_prazos_pendentes() -> list[dict]:
+    """Pergunta ao ML o prazo de despacho das vendas do Mural que ainda estão sem data.
+
+    Roda em background (BackgroundTasks do Mural), então NUNCA pode estourar pra cima:
+    qualquer falha vira log, nada propaga. Idempotente e auto-limitada — se duas
+    requisições do poll caírem juntas, a segunda desiste no lock em vez de duplicar
+    as chamadas ao ML."""
+    if _LOCK_PRAZOS.locked():
+        return []
+    async with _LOCK_PRAZOS:
+        agora = time.monotonic()
+        try:
+            pedidos = await vendas_db.get_mural_pedidos()
+        except Exception as e:
+            logger.warning("revalidar_prazos: nao consegui ler o Mural: %s", e)
+            return []
+
+        sem_prazo = [p for p in pedidos if not (p.get("data_limite") or "").strip()]
+        alvos = [p for p in sem_prazo
+                 if agora - _ULTIMA_TENTATIVA.get(p["venda"], 0.0) >= _INTERVALO_TENTATIVA]
+        if not alvos:
+            return []
+
+        token_store = TokenStore()
+        meli_cache: dict[str, MeliService] = {}
+        preenchidos = []
+        for p in alvos[:_MAX_POR_RODADA]:
+            _ULTIMA_TENTATIVA[p["venda"]] = agora
+            try:
+                meli = meli_cache.get(p["empresa"])
+                if meli is None:
+                    store = await token_store.get_by_company_or_nickname(p["empresa"])
+                    if not store:
+                        continue
+                    meli = MeliService(store, token_store=token_store)
+                    meli_cache[p["empresa"]] = meli
+                order, shipping_id = await meli.resolve_order_and_shipping(p["venda"])
+                if not shipping_id:
+                    continue
+                deadline = await meli.get_delivery_deadline({"shipping": {"id": shipping_id}})
+                if not deadline:
+                    continue   # o ML ainda não sabe; tenta de novo na próxima rodada
+                await vendas_db.set_data_limite(p["venda"], deadline)
+                logger.info("[%s] Venda %s: prazo de despacho preenchido -> %s",
+                            p["empresa"], p["venda"], deadline)
+                preenchidos.append({"venda": p["venda"], "data_limite": deadline})
+            except Exception as e:
+                logger.warning("revalidar_prazos: venda %s falhou: %s", p["venda"], e)
+
+        _esquecer_tentativas_antigas(agora)
+        return preenchidos

@@ -3,11 +3,13 @@ manual de status (correção quando uma etiqueta física se perde) e conexão/
 desconexão de lojas do Mercado Livre. Acesso por senha própria (GERENTE_PASSWORD),
 separada da senha operacional do Mural/Embalagem/Gaiolas.
 """
-from datetime import date
+import json
+from datetime import date, datetime, timedelta, timezone
 from fastapi import APIRouter, Request, Form, Query, Depends
 from fastapi.responses import RedirectResponse, Response
 from templates_engine import templates
 from services import vendas_db
+from services import dashboard_db
 from services.token_store import TokenStore
 from services.session_auth import require_gerente
 from services import db as db_service
@@ -43,12 +45,15 @@ def _parse_data_br(valor: str) -> date | None:
 
 
 async def _opcoes_filtro() -> list[str]:
-    """Lojas distintas vistas na aba Vendas + devoluções — base estável pro dropdown
-    de loja do Gerente (não é afetada pelos filtros atualmente aplicados). O filtro de
-    dia virou um intervalo de calendário (dia_de/dia_ate), não precisa mais de opções
-    pré-computadas."""
-    todos = await vendas_db.get_all_pedidos()
-    lojas = {p["empresa"] for p in todos if p["empresa"]}
+    """Lojas distintas com venda + devoluções — base estável pro dropdown de loja do
+    Gerente (não é afetada pelos filtros atualmente aplicados). O filtro de dia virou
+    um intervalo de calendário (dia_de/dia_ate), não precisa mais de opções
+    pré-computadas.
+
+    Usa o DISTINCT do banco: antes carregava TODOS os pedidos com todos os itens só
+    pra ler um campo, e isso acontecia a cada render da tabela — uma varredura inteira
+    além da que já busca os pedidos."""
+    lojas = set(await vendas_db.listar_empresas())
 
     devolucoes = await db_service.listar_devolucoes(pendentes=False)
     for d in devolucoes:
@@ -58,11 +63,19 @@ async def _opcoes_filtro() -> list[str]:
     return sorted(lojas)
 
 
-async def _devolucao_para_pedido(d: dict) -> dict:
+def _devolucao_para_pedido(d: dict, pedidos_por_venda: dict[str, dict]) -> dict:
     """Converte um registro de devolução (Postgres) num dict no mesmo formato dos
-    pedidos de venda, pra poder entrar na mesma tabela/filtros do Gerente."""
-    pedido = await vendas_db.get_pedido_by_venda(d["venda_ml"]) if d.get("venda_ml") else None
-    data_limite = d["criado_em"].astimezone(_BR_TZ).strftime("%d/%m/%Y") if d.get("criado_em") else ""
+    pedidos de venda, pra poder entrar na mesma tabela/filtros do Gerente.
+
+    Recebe os pedidos já carregados em vez de buscar o seu: buscando um por um, cada
+    devolução na tela custava uma varredura completa da tabela de vendas (ver
+    `vendas_db.get_pedidos_por_venda`)."""
+    pedido = pedidos_por_venda.get(d["venda_ml"]) if d.get("venda_ml") else None
+    # A data que representa a devolução na tabela é a da CHEGADA quando ela existe:
+    # `criado_em` é só quando nós registramos, que pode ser dias antes do pacote
+    # aparecer no galpão (ou depois, se o registro veio atrasado).
+    quando = d.get("chegou_em") or d.get("criado_em")
+    data_limite = quando.astimezone(_BR_TZ).strftime("%d/%m/%Y") if quando else ""
     return {
         "venda": d.get("venda_ml") or d.get("order_id") or d["claim_id"],
         "order_id": d.get("order_id"),
@@ -76,6 +89,7 @@ async def _devolucao_para_pedido(d: dict) -> dict:
         "data_limite": data_limite,
         "origem": "Expedição",   # devolução nunca é de pedido Full (o ML trata isso sozinho)
         "criado_em": d.get("criado_em"),
+        "chegou_em": d.get("chegou_em"),
         "_devolucao": d,
     }
 
@@ -116,6 +130,19 @@ def _pedido_visivel(p: dict, status: list[str], busca: str, loja: str,
     return True
 
 
+# Anterior a qualquer registro do sistema — usado só como piso de ordenação, pra que
+# uma linha sem data vá pro fim em vez de estourar a comparação.
+_SEM_DATA = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _quando_entrou(p: dict) -> datetime:
+    """Momento que ordena a tabela do Gerente: para uma devolução é a chegada do
+    pacote (caindo pro registro enquanto o ML não confirmou), e para uma venda é
+    quando ela entrou. Sem isso as devoluções eram jogadas no fim da lista pelo
+    append, fora de qualquer ordem cronológica."""
+    return p.get("chegou_em") or p.get("criado_em") or _SEM_DATA
+
+
 async def _pedidos_unificados(status: list[str], busca: str, loja: str,
                                dia_de: str, dia_ate: str, origem: list[str] | None = None,
                                dia_criado_de: str = "", dia_criado_ate: str = "") -> list[dict]:
@@ -123,22 +150,29 @@ async def _pedidos_unificados(status: list[str], busca: str, loja: str,
     mesmos filtros aplicados nas duas fontes. `dia_de`/`dia_ate` (data-limite de
     despacho) e `dia_criado_de`/`dia_criado_ate` (quando a venda foi registrada)
     no formato ISO ("AAAA-MM-DD", o que um <input type="date"> manda)."""
+    # "Devolução" é categoria de exibição, não Status da planilha. Filtrar SÓ por ela
+    # tem que devolver zero vendas — antes sobrava uma lista vazia de status, que
+    # `get_all_pedidos` lia como "sem filtro" e trazia a tabela inteira de volta.
     status_sheets = [s for s in status if s in STATUS_OPCOES] if status else None
+    so_devolucoes = bool(status) and not status_sheets
     origem_filter = origem or None
-    pedidos = await vendas_db.get_all_pedidos(status_sheets, busca, loja, dia_de, dia_ate, origem_filter,
-                                               dia_criado_de, dia_criado_ate)
 
-    # Cancelado nunca muda de Status na planilha — o que diz se já foi tratado é
-    # só o Postgres (ver routers/mural.py, mesma regra aplicada aqui pro badge).
-    arquivados = await db_service.listar_cancelados_arquivados()
-    # Pedido que virou "Cancelado" no ML por causa de uma devolução concluída
-    # (reembolso total) já aparece como "Devolução" logo abaixo — tira daqui pra
-    # não duplicar o mesmo pedido nos 2 grupos.
-    com_devolucao = await db_service.listar_vendas_com_devolucao()
-    pedidos = [p for p in pedidos if not (p["status"].lower() == "cancelado" and p["venda"] in com_devolucao)]
-    for p in pedidos:
-        if p["status"].lower() == "cancelado":
-            p["_cancelado_resolvido"] = p["venda"] in arquivados
+    if so_devolucoes:
+        pedidos: list[dict] = []
+    else:
+        pedidos = await vendas_db.get_all_pedidos(status_sheets, busca, loja, dia_de, dia_ate,
+                                                   origem_filter, dia_criado_de, dia_criado_ate)
+        # Cancelado nunca muda de Status na planilha — o que diz se já foi tratado é
+        # só o Postgres (ver routers/mural.py, mesma regra aplicada aqui pro badge).
+        arquivados = await db_service.listar_cancelados_arquivados()
+        # Pedido que virou "Cancelado" no ML por causa de uma devolução concluída
+        # (reembolso total) já aparece como "Devolução" logo abaixo — tira daqui pra
+        # não duplicar o mesmo pedido nos 2 grupos.
+        com_devolucao = await db_service.listar_vendas_com_devolucao()
+        pedidos = [p for p in pedidos if not (p["status"].lower() == "cancelado" and p["venda"] in com_devolucao)]
+        for p in pedidos:
+            if p["status"].lower() == "cancelado":
+                p["_cancelado_resolvido"] = p["venda"] in arquivados
 
     if (not status or "Devolução" in status) and (not origem_filter or "Expedição" in origem_filter):
         de = date.fromisoformat(dia_de) if dia_de else None
@@ -146,9 +180,12 @@ async def _pedidos_unificados(status: list[str], busca: str, loja: str,
         de_c = date.fromisoformat(dia_criado_de) if dia_criado_de else None
         ate_c = date.fromisoformat(dia_criado_ate) if dia_criado_ate else None
         devolucoes = await db_service.listar_devolucoes(pendentes=False)
+        # Uma consulta pros pedidos de TODAS as devoluções, antes do laço.
+        pedidos_dev = await vendas_db.get_pedidos_por_venda(
+            [d["venda_ml"] for d in devolucoes if d.get("venda_ml")])
         busca_norm = (busca or "").strip().lower()
         for d in devolucoes:
-            p = await _devolucao_para_pedido(d)
+            p = _devolucao_para_pedido(d, pedidos_dev)
             if loja and p["empresa"].strip().lower() != loja.strip().lower():
                 continue
             if de or ate:
@@ -165,6 +202,7 @@ async def _pedidos_unificados(status: list[str], busca: str, loja: str,
                     continue
             pedidos.append(p)
 
+    pedidos.sort(key=_quando_entrou, reverse=True)
     return pedidos
 
 
@@ -198,6 +236,43 @@ async def gerente_page(request: Request):
         "request": request, "status_opcoes": FILTRO_STATUS_OPCOES,
         "origem_opcoes": ORIGEM_OPCOES,
         "lojas_disponiveis": lojas_disponiveis,
+    })
+
+
+@router.get("/dashboard")
+async def gerente_dashboard(request: Request):
+    lojas_disponiveis = await _opcoes_filtro()
+    hoje = date.today()
+    return templates.TemplateResponse("gerente_dashboard.html", {
+        "request": request,
+        "origem_opcoes": ORIGEM_OPCOES,
+        "lojas_disponiveis": lojas_disponiveis,
+        # Mesmos 14 dias que o endpoint de dados assume por padrão — os campos já
+        # abrem preenchidos pra ficar explícito qual período está na tela.
+        "padrao_de": (hoje - timedelta(days=13)).isoformat(),
+        "padrao_ate": hoje.isoformat(),
+    })
+
+
+@router.get("/dashboard/dados")
+async def gerente_dashboard_dados(request: Request,
+                                   loja: list[str] = Query([]), origem: list[str] = Query([]),
+                                   dia_de: str = Query(""), dia_ate: str = Query(""),
+                                   cancelados: bool = Query(False)):
+    """Fragmento htmx com os números do painel. Sem período informado, mostra os
+    últimos 14 dias — abrir a tela e ver a base inteira somada desde a migração
+    diria pouco sobre a operação de agora."""
+    de = date.fromisoformat(dia_de) if dia_de else date.today() - timedelta(days=13)
+    ate = date.fromisoformat(dia_ate) if dia_ate else date.today()
+    dados = await dashboard_db.carregar(de, ate, loja or None, origem or None, cancelados)
+    # As mesmas cores que identificam a loja no Mural e na Embalagem — a cor da loja
+    # é a mesma em todo o sistema, não uma paleta só do gráfico.
+    cores = await TokenStore().get_cores_por_empresa()
+    return templates.TemplateResponse("_gerente_dashboard_dados.html", {
+        "request": request, "d": dados,
+        "serie_json": json.dumps(dados["serie"]),
+        "cores_json": json.dumps(cores),
+        "cores": cores,
     })
 
 
@@ -318,7 +393,8 @@ async def finalizar_devolucao_pedidos(request: Request, claim_id: str,
     pedidos (htmx). Atualiza só a linha clicada — mesmo motivo do /status acima."""
     await db_service.finalizar_devolucao(claim_id)
     d = await db_service.get_devolucao(claim_id)
-    pedido = await _devolucao_para_pedido(d) if d else None
+    pedidos_dev = await vendas_db.get_pedidos_por_venda([d["venda_ml"]]) if d and d.get("venda_ml") else {}
+    pedido = _devolucao_para_pedido(d, pedidos_dev) if d else None
     return _linha_ou_vazio(request, pedido, status, busca, loja, dia_de, dia_ate, origem,
                             dia_criado_de, dia_criado_ate)
 
@@ -385,6 +461,8 @@ async def notificacoes_page(request: Request):
     for d in devolucoes:
         if d.get("criado_em"):
             d["criado_em"] = d["criado_em"].astimezone(_BR_TZ)
+        if d.get("chegou_em"):
+            d["chegou_em"] = d["chegou_em"].astimezone(_BR_TZ)
 
     return templates.TemplateResponse("gerente_notificacoes.html", {
         "request": request, "notificacoes": notificacoes, "devolucoes": devolucoes,

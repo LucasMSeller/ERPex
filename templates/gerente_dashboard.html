@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Gerente — ERPex{% endblock %}
+{% block content %}
+<div class="flex items-center justify-between mb-2">
+  <h1 class="text-xl font-semibold">Painel do Gerente</h1>
+  <a href="/gerente/lojas" class="text-sm text-slate-600 hover:text-slate-900 underline">Conexão de lojas →</a>
+</div>
+
+<div class="flex items-center gap-1 mb-6 border-b border-slate-200">
+  <a href="/gerente" class="px-3 py-2 text-sm text-slate-500 hover:text-slate-900 border-b-2 border-transparent">Pedidos</a>
+  <a href="/gerente/dashboard" class="px-3 py-2 text-sm font-medium text-slate-900 border-b-2 border-slate-900">Dashboard</a>
+</div>
+
+<div id="filtros-dash" class="mb-5 text-sm">
+  <div class="flex flex-wrap items-end gap-5">
+    <div class="flex items-center gap-1">
+      <label class="text-slate-500 text-xs">De</label>
+      <input type="date" name="dia_de" value="{{ padrao_de }}"
+             class="border border-slate-300 rounded-lg px-2 py-1.5 text-sm">
+      <label class="text-slate-500 text-xs">até</label>
+      <input type="date" name="dia_ate" value="{{ padrao_ate }}"
+             class="border border-slate-300 rounded-lg px-2 py-1.5 text-sm">
+    </div>
+
+    <div class="flex items-center gap-3">
+      <span class="text-slate-500 text-xs">Loja:</span>
+      {% for l in lojas_disponiveis %}
+      <label class="flex items-center gap-1.5">
+        <input type="checkbox" name="loja" value="{{ l }}" class="rounded border-slate-300">
+        {{ l }}
+      </label>
+      {% endfor %}
+      <span class="text-slate-400 text-xs">(nenhuma marcada = todas)</span>
+    </div>
+
+    <div class="flex items-center gap-3">
+      <span class="text-slate-500 text-xs">Origem:</span>
+      {% for o in origem_opcoes %}
+      <label class="flex items-center gap-1.5">
+        <input type="checkbox" name="origem" value="{{ o }}"
+               {% if o == "Expedição" %}checked{% endif %} class="rounded border-slate-300">
+        {{ o }}
+      </label>
+      {% endfor %}
+    </div>
+
+    <label class="flex items-center gap-1.5" title="Cancelado não é venda realizada — por padrão fica fora da contagem.">
+      <input type="checkbox" name="cancelados" value="true" class="rounded border-slate-300">
+      Incluir cancelados
+    </label>
+  </div>
+</div>
+
+<div id="dash" data-poll
+     hx-get="/gerente/dashboard/dados" hx-include="#filtros-dash"
+     hx-trigger="load, poll-tick, change from:#filtros-dash"
+     hx-swap="innerHTML">
+  <p class="text-sm text-slate-400">Carregando…</p>
+</div>
+{% endblock %}

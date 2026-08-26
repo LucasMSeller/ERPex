@@ -69,7 +69,11 @@
       <div class="text-sm flex items-center flex-wrap gap-2">
         <span class="font-mono font-semibold">{{ d.venda_ml or d.order_id or "—" }}</span>
         <span class="text-slate-500">{{ d.empresa or "—" }}</span>
-        <span class="text-slate-400">chegou em {{ d.criado_em.strftime("%d/%m/%Y") if d.criado_em else "—" }}</span>
+        {% if d.chegou_em %}
+        <span class="text-slate-400">chegou em {{ d.chegou_em.strftime("%d/%m/%Y") }}</span>
+        {% else %}
+        <span class="text-slate-400">registrado em {{ d.criado_em.strftime("%d/%m/%Y") if d.criado_em else "—" }}</span>
+        {% endif %}
         {% if resolvido %}
         <span class="text-xs px-2 py-0.5 rounded-full bg-slate-200 text-slate-600">Finalizada</span>
         {% elif d.status_ml == "closed" %}

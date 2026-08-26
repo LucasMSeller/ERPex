@@ -1,10 +1,16 @@
-"""Cloud SQL (Postgres) — banco à parte só pra dados de notificação/cancelamento.
-Não substitui o Sheets (Vendas/Endereçamento/Fiscal continuam lá); aqui mora só o
-que não é tabular por natureza (motivo, histórico) e cresce com o tempo.
+"""Cloud SQL (Postgres) — banco dos dados operacionais (vendas, devoluções,
+endereçamento, credenciais das lojas).
 
-Sem pool/ORM: cada função abre e fecha sua própria conexão via Cloud SQL Python
-Connector (que já mantém o túnel seguro internamente) — mesmo espírito enxuto do
-sheets_service.py/token_store.py, adequado ao volume baixo de uma tela interna.
+As conexões vêm de um POOL. Antes cada função abria e fechava a sua, o que era
+adequado ao volume — até deixar de ser: em 10/08/2026 tivemos 19 erros de conexão
+em 24h (`ServerDisconnectedError`, `ConnectionDoesNotExistError`, `BrokenPipeError`)
+e DUAS vendas pagas se perderam, porque o webhook do Mercado Livre falhou nas três
+tentativas e ele desistiu. Abrir conexão por chamada não é só lento: sob
+instabilidade, custa pedido.
+
+O pool é criado sob demanda e, se por algum motivo não subir, o código cai para uma
+conexão avulsa — o pior caso passa a ser o comportamento antigo, nunca uma tela fora
+do ar.
 """
 import asyncio
 import json
@@ -16,6 +22,8 @@ from config.settings import get_settings
 logger = logging.getLogger(__name__)
 
 _connector: Connector | None = None
+_pool: asyncpg.Pool | None = None
+_pool_lock: asyncio.Lock | None = None
 
 
 def _get_connector() -> Connector:
@@ -29,7 +37,13 @@ def _get_connector() -> Connector:
     return _connector
 
 
-async def _get_connection() -> asyncpg.Connection:
+async def _abrir_conexao(*_args, **_kwargs) -> asyncpg.Connection:
+    """Abre uma conexão nova via Cloud SQL Connector.
+
+    Aceita e descarta argumentos porque o asyncpg chama esta função como sua
+    `connect=` do pool, passando coisas dele (`loop`, `timeout`, `connection_class`).
+    O Connector monta a conexão por conta própria a partir das settings, então nada
+    disso se aplica aqui — mas recusar os kwargs derruba a criação do pool."""
     settings = get_settings()
     connector = _get_connector()
     return await connector.connect_async(
@@ -41,9 +55,75 @@ async def _get_connection() -> asyncpg.Connection:
     )
 
 
+class _ConexaoDoPool:
+    """Faz uma conexão emprestada do pool se comportar como as antigas.
+
+    O projeto inteiro usa `conn = await _get_connection()` … `finally: await
+    conn.close()` — são 56 lugares, quase todos mexendo com dado de produção.
+    Reescrever todos para `async with pool.acquire()` seria uma varredura de risco
+    desnecessário: este proxy delega tudo para a conexão real e só reinterpreta
+    `close()`, que passa a DEVOLVER ao pool em vez de encerrar."""
+    __slots__ = ("_conn", "_pool_ref", "_devolvida")
+
+    def __init__(self, pool: asyncpg.Pool, conn: asyncpg.Connection):
+        self._pool_ref = pool
+        self._conn = conn
+        self._devolvida = False
+
+    def __getattr__(self, nome: str):
+        # Só chega aqui quando o atributo não existe nos __slots__. Atributo
+        # interno faltando significa proxy meio-construído — deixar cair no
+        # getattr abaixo entraria em recursão.
+        if nome.startswith("_"):
+            raise AttributeError(nome)
+        return getattr(self._conn, nome)
+
+    async def close(self) -> None:
+        if self._devolvida:
+            return   # `finally` duplicado não pode devolver a mesma conexão 2x
+        self._devolvida = True
+        await self._pool_ref.release(self._conn)
+
+
+async def _get_pool() -> asyncpg.Pool:
+    global _pool, _pool_lock
+    if _pool is not None:
+        return _pool
+    if _pool_lock is None:
+        _pool_lock = asyncio.Lock()
+    async with _pool_lock:
+        if _pool is None:   # outro request pode ter criado enquanto esperávamos
+            _pool = await asyncpg.create_pool(
+                connect=_abrir_conexao,
+                min_size=1,
+                max_size=8,
+                # O Cloud SQL corta conexões ociosas por conta própria; reciclar
+                # antes disso evita pegar do pool uma conexão já morta do outro lado.
+                max_inactive_connection_lifetime=120.0,
+                command_timeout=30.0,
+            )
+            logger.info("Pool de conexões criado (min=1, max=8).")
+    return _pool
+
+
+async def _get_connection():
+    """Conexão pronta para uso. Devolve o proxy do pool; se o pool não estiver
+    disponível, abre uma avulsa — degradar para o comportamento antigo é melhor
+    que derrubar a requisição."""
+    try:
+        pool = await _get_pool()
+        return _ConexaoDoPool(pool, await pool.acquire())
+    except Exception as e:
+        logger.warning("Pool indisponível (%s) — abrindo conexão avulsa.", e)
+        return await _abrir_conexao()
+
+
 async def close() -> None:
-    """Fecha o connector (chamado no shutdown do app)."""
-    global _connector
+    """Fecha pool e connector (chamado no shutdown do app)."""
+    global _connector, _pool
+    if _pool is not None:
+        await _pool.close()
+        _pool = None
     if _connector is not None:
         await _connector.close_async()
         _connector = None
@@ -79,6 +159,25 @@ CREATE TABLE IF NOT EXISTS devolucoes (
     prazo_devolucao TIMESTAMPTZ,
     avaliado_em TIMESTAMPTZ,
     finalizado_em TIMESTAMPTZ,
+    -- `fase` é a etapa FÍSICA (a caminho / chegou / encerrada), gravada em vez de
+    -- consultada ao vivo na renderização: o Mural tem poll, e perguntar ao ML uma
+    -- vez por devolução a cada ciclo era uma chamada HTTP por card por atualização.
+    fase TEXT,
+    fase_em TIMESTAMPTZ,
+    -- Quando o pacote chegou DE VERDADE (vem do histórico do envio), que não é o
+    -- mesmo que `criado_em` — este é só o instante em que nós registramos.
+    chegou_em TIMESTAMPTZ,
+    -- Só no retorno sem entrega: é pelo envio original que se acompanha a volta,
+    -- já que não existe claim no ML pra consultar (ver sync_service).
+    shipping_id TEXT,
+    -- Pra onde o pacote vai: 'seller_address' (nosso galpão) ou 'warehouse'
+    -- (depósito do ML). Sem isto, devolução que nunca chega aqui aparecia no Mural
+    -- pedindo confirmação de recebimento. NULL = retorno sem entrega (vem sempre
+    -- pra cá) ou devolução registrada antes desta coluna existir.
+    destino TEXT,
+    -- `id` da devolução no ML. É ele, não o claim_id, que as ações de devolução
+    -- exigem (revisão, anexo). Guardado pra não precisar consultar de novo.
+    return_id TEXT,
     criado_em TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -225,7 +324,13 @@ INSERT INTO romaneio_sequencia (id, ultimo_seq) VALUES (1, 0) ON CONFLICT (id) D
 # CREATE TABLE IF NOT EXISTS não altera uma tabela que já existe em produção.
 MIGRATIONS = """
 ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS prazo_devolucao TIMESTAMPTZ;
+ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS destino TEXT;
+ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS return_id TEXT;
 ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS status_ml TEXT;
+ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS fase TEXT;
+ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS fase_em TIMESTAMPTZ;
+ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS chegou_em TIMESTAMPTZ;
+ALTER TABLE devolucoes ADD COLUMN IF NOT EXISTS shipping_id TEXT;
 ALTER TABLE vendas ADD COLUMN IF NOT EXISTS origem TEXT NOT NULL DEFAULT 'Expedição';
 ALTER TABLE vendas ADD COLUMN IF NOT EXISTS enviado_em TEXT NOT NULL DEFAULT '';
 ALTER TABLE guias_retirada ADD COLUMN IF NOT EXISTS romaneio_id TEXT NOT NULL DEFAULT '';
@@ -312,10 +417,26 @@ async def listar_vendas_com_devolucao() -> set[str]:
         await conn.close()
 
 
+async def definir_destino_devolucao(claim_id: str, destino: str) -> None:
+    """Grava pra onde o pacote da devolução vai ('seller_address' | 'warehouse').
+
+    Só preenche o que está vazio: o destino é um fato do envio de volta, e uma
+    consulta posterior não deve reescrever o que já foi estabelecido."""
+    conn = await _get_connection()
+    try:
+        await conn.execute(
+            "UPDATE devolucoes SET destino = $2 WHERE claim_id = $1 AND destino IS NULL",
+            str(claim_id), destino)
+    finally:
+        await conn.close()
+
+
 async def registrar_devolucao(claim_id: str, venda_ml: str | None, order_id: str | None,
                                empresa: str | None, tipo: str | None, stage: str | None,
                                motivo: str | None, data_evento, raw: dict,
-                               prazo_devolucao=None, status_ml: str | None = None) -> None:
+                               prazo_devolucao=None, status_ml: str | None = None,
+                               shipping_id: str | None = None, destino: str | None = None,
+                               return_id: str | None = None) -> None:
     """Grava ou atualiza (o claim do ML pode ser consultado/reenviado várias vezes ao
     longo da vida da devolução, ex.: "opened" → "closed") — os campos que vêm do ML
     (status_ml/tipo/stage/motivo/raw) sempre são atualizados pro valor mais recente;
@@ -323,33 +444,74 @@ async def registrar_devolucao(claim_id: str, venda_ml: str | None, order_id: str
 
     `prazo_devolucao`: data limite pro item físico chegar de volta (quando o ML informar
     isso no claim); enquanto não tivermos isso, fica None e o card mostra "Aguardando
-    devolução" sem prazo."""
+    devolução" sem prazo.
+
+    `shipping_id`: só no retorno sem entrega, onde não existe claim e a volta do pacote
+    é acompanhada pelo envio original. COALESCE porque um reenvio de webhook sem esse
+    dado não pode apagar o que já foi guardado.
+
+    `destino` ('seller_address' | 'warehouse') e `return_id` seguem a mesma regra do
+    COALESCE: eles só existem depois que o ML cria o envio de volta, então as primeiras
+    notificações do claim chegam sem eles e não podem apagar o que veio depois."""
     conn = await _get_connection()
     try:
         await conn.execute(
             """INSERT INTO devolucoes (claim_id, venda_ml, order_id, empresa, tipo, stage, motivo,
-                                        data_evento, raw, prazo_devolucao, status_ml)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)
+                                        data_evento, raw, prazo_devolucao, status_ml, shipping_id,
+                                        destino, return_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14)
                ON CONFLICT (claim_id) DO UPDATE SET
                    tipo = EXCLUDED.tipo, stage = EXCLUDED.stage, motivo = EXCLUDED.motivo,
                    raw = EXCLUDED.raw, status_ml = EXCLUDED.status_ml,
-                   prazo_devolucao = COALESCE(EXCLUDED.prazo_devolucao, devolucoes.prazo_devolucao)""",
+                   prazo_devolucao = COALESCE(EXCLUDED.prazo_devolucao, devolucoes.prazo_devolucao),
+                   shipping_id = COALESCE(EXCLUDED.shipping_id, devolucoes.shipping_id),
+                   destino = COALESCE(EXCLUDED.destino, devolucoes.destino),
+                   return_id = COALESCE(EXCLUDED.return_id, devolucoes.return_id)""",
             claim_id, venda_ml, order_id, empresa, tipo, stage, motivo, data_evento,
-            json.dumps(raw), prazo_devolucao, status_ml,
+            json.dumps(raw), prazo_devolucao, status_ml, shipping_id, destino, return_id,
+        )
+    finally:
+        await conn.close()
+
+
+async def salvar_fase_devolucao(claim_id: str, fase: str, chegou_em=None) -> None:
+    """Guarda a etapa física apurada no ML pra que a tela leia daqui, não da API.
+
+    `chegou_em` só avança de NULL pra uma data (COALESCE): a data de chegada é um fato
+    histórico, e uma consulta posterior que não a encontre não pode apagá-la."""
+    conn = await _get_connection()
+    try:
+        await conn.execute(
+            "UPDATE devolucoes SET fase = $2, fase_em = now(), "
+            "chegou_em = COALESCE(devolucoes.chegou_em, $3) WHERE claim_id = $1",
+            claim_id, fase, chegou_em,
         )
     finally:
         await conn.close()
 
 
 async def listar_devolucoes(pendentes: bool = True) -> list[dict]:
-    """`pendentes=True` (Mural, expedição): só devoluções que ainda precisam de ação —
-    claim ainda aberto no ML E ainda não finalizado por nós. `pendentes=False` (Gerente):
-    histórico completo, incluindo já concluídas — registro permanente, como as vendas."""
+    """`pendentes=True` (Mural, expedição): devoluções cujo PACOTE ainda é assunto do
+    galpão. `pendentes=False` (Gerente): histórico completo — registro permanente.
+
+    O que tira do Mural é a nossa baixa (`status = 'Finalizada'`) ou o pacote ter
+    parado de vir (`fase = 'Encerrada'`: cancelada, expirada, devolvida ao comprador,
+    perdida).
+
+    Até 20/08/2026 o filtro era `status_ml IS DISTINCT FROM 'closed'`, e isso
+    confundia duas coisas independentes: o ML fechar a RECLAMAÇÃO não faz o PACOTE
+    chegar. Foi o que aconteceu com PLG100826001 — o ML encerrou a disputa a favor do
+    comprador no dia 19, e a devolução sumiu do Mural enquanto o pacote ainda estava a
+    caminho (chegada prevista entre 20 e 23/08). A expedição ia receber uma caixa sem
+    card nenhum esperando por ela.
+
+    `fase` NULL (recém-registrada, ainda não consultada) conta como pendente: na
+    dúvida o card aparece, porque some-lo é o erro que custa caro."""
     conn = await _get_connection()
     try:
         query = "SELECT * FROM devolucoes"
         if pendentes:
-            query += " WHERE status != 'Finalizada' AND status_ml IS DISTINCT FROM 'closed'"
+            query += " WHERE status != 'Finalizada' AND fase IS DISTINCT FROM 'Encerrada'"
         query += " ORDER BY criado_em DESC"
         rows = await conn.fetch(query)
         return [dict(r) for r in rows]
@@ -385,6 +547,47 @@ async def get_devolucao(claim_id: str) -> dict | None:
     try:
         row = await conn.fetchrow("SELECT * FROM devolucoes WHERE claim_id = $1", claim_id)
         return dict(row) if row else None
+    finally:
+        await conn.close()
+
+
+async def definir_shipping_devolucao(claim_id: str, shipping_id: str) -> None:
+    """Amarra uma devolução ao envio, quando o registro é anterior a esse campo
+    existir. Sem isso, um retorno gravado antes não teria como ser reconsultado."""
+    conn = await _get_connection()
+    try:
+        await conn.execute(
+            "UPDATE devolucoes SET shipping_id = $2 WHERE claim_id = $1 AND shipping_id IS NULL",
+            claim_id, str(shipping_id),
+        )
+    finally:
+        await conn.close()
+
+
+async def get_devolucao_por_shipping(shipping_id: str) -> dict | None:
+    """A devolução amarrada a um envio — usado pelo webhook de shipments, que só
+    conhece o envio. Só o retorno sem entrega preenche `shipping_id`."""
+    conn = await _get_connection()
+    try:
+        row = await conn.fetchrow(
+            "SELECT * FROM devolucoes WHERE shipping_id = $1 "
+            "ORDER BY criado_em DESC LIMIT 1", str(shipping_id))
+        return dict(row) if row else None
+    finally:
+        await conn.close()
+
+
+async def contar_retiradas_do_dia() -> int:
+    """Quantas gaiolas já saíram do galpão HOJE (guias efetivamente registradas).
+
+    O corte é o dia de Brasília, não UTC: uma coleta das 22h viraria "amanhã" se
+    contada em UTC, e o papel na mão do motorista diz outra data."""
+    conn = await _get_connection()
+    try:
+        return await conn.fetchval(
+            "SELECT count(*) FROM guias_retirada "
+            "WHERE (criado_em - interval '3 hours')::date = (now() - interval '3 hours')::date"
+        ) or 0
     finally:
         await conn.close()
 

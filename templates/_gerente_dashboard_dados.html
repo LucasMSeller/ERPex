@@ -1,0 +1,325 @@
+{# Cor da loja vem do cadastro (a mesma do Mural). Reserva só para loja sem cor. #}
+{% set reserva = ["#2a78d6", "#eb6834", "#1baf7a"] %}
+
+<div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-4">
+  <div class="bg-white border border-slate-200 rounded-xl px-4 py-3">
+    <div class="text-xs uppercase tracking-wide text-slate-400 font-semibold">Vendas no período</div>
+    <div class="text-3xl font-semibold tabular-nums">{{ d.total }}</div>
+  </div>
+  <div class="bg-white border border-slate-200 rounded-xl px-4 py-3">
+    <div class="text-xs uppercase tracking-wide text-slate-400 font-semibold">Na fila agora</div>
+    <div class="text-3xl font-semibold tabular-nums">{{ d.fila }}</div>
+    <div class="text-xs text-slate-400">
+      separando, separado e embalado
+      {% if d.fila > d.fila_no_periodo %}
+      <br><span class="text-amber-700">{{ d.fila - d.fila_no_periodo }} de antes do período</span>
+      {% endif %}
+    </div>
+  </div>
+  <div class="{% if d.atrasados %}bg-red-50 border-red-500{% else %}bg-white border-slate-200{% endif %} border rounded-xl px-4 py-3">
+    <div class="text-xs uppercase tracking-wide text-slate-400 font-semibold">Atrasados</div>
+    <div class="text-3xl font-semibold tabular-nums {% if d.atrasados %}text-red-700{% endif %}">{{ d.atrasados|length }}</div>
+    <div class="text-xs text-slate-400">passaram do prazo, em qualquer data</div>
+  </div>
+  <div class="bg-white border border-slate-200 rounded-xl px-4 py-3">
+    <div class="text-xs uppercase tracking-wide text-slate-400 font-semibold">Despachados</div>
+    <div class="text-3xl font-semibold tabular-nums">{{ d.enviados }}</div>
+    <div class="text-xs text-slate-400">{{ d.pct_enviados }}% do período</div>
+  </div>
+  <div class="bg-white border border-slate-200 rounded-xl px-4 py-3">
+    <div class="text-xs uppercase tracking-wide text-slate-400 font-semibold">Devoluções</div>
+    <div class="text-3xl font-semibold tabular-nums">{{ d.devolucoes }}</div>
+    <div class="text-xs text-slate-400">{{ d.pct_devolucoes }}% das vendas</div>
+  </div>
+</div>
+
+<div class="grid md:grid-cols-3 gap-4 mb-4">
+  <div class="md:col-span-2 bg-white border border-slate-200 rounded-xl px-4 py-4">
+    <div class="flex items-baseline justify-between flex-wrap gap-3 mb-3">
+      <h3 class="text-sm font-semibold">Vendas por dia</h3>
+      <div class="flex gap-4 text-xs text-slate-600">
+        {% for l in d.serie.lojas %}
+        <span class="flex items-center gap-1.5">
+          <span class="inline-block w-2.5 h-2.5 rounded-full"
+                style="background: {{ cores.get(l.nome) or reserva[loop.index0 % 3] }}"></span>
+          {{ l.nome }}
+        </span>
+        {% endfor %}
+      </div>
+    </div>
+    {% if d.serie.dias %}
+    <div class="relative" id="plot-vendas">
+      <svg id="svg-vendas" viewBox="0 0 720 240" class="block w-full h-auto"
+           role="img" aria-label="Vendas por dia e por loja no período selecionado."></svg>
+      <div id="tip-vendas"
+           class="absolute opacity-0 pointer-events-none bg-white border border-slate-200 rounded-lg shadow-lg px-3 py-2 text-xs min-w-[140px] z-10"></div>
+    </div>
+    {% else %}
+    <p class="text-sm text-slate-400 py-12 text-center">Nenhuma venda no período.</p>
+    {% endif %}
+  </div>
+
+  <div class="bg-white border border-slate-200 rounded-xl px-4 py-4">
+    <h3 class="text-sm font-semibold mb-1">Onde os pedidos estão</h3>
+    <p class="text-xs text-slate-400 mb-4">Situação atual, período todo</p>
+    {% set maior = d.por_status|map(attribute="n")|max if d.por_status else 1 %}
+    <div class="flex flex-col gap-3">
+      {% for s in d.por_status %}
+      <div>
+        <div class="flex justify-between text-xs mb-1">
+          <span class="text-slate-600">{{ s.nome }}</span>
+          <span class="font-semibold tabular-nums">{{ s.n }}</span>
+        </div>
+        <div class="h-2 bg-slate-100 rounded-full overflow-hidden">
+          <div class="h-full rounded-full" style="width: {{ (s.n * 100 / maior)|round(1) }}%; background: #2a78d6;"></div>
+        </div>
+      </div>
+      {% else %}
+      <p class="text-sm text-slate-400">Sem pedidos no período.</p>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+<div class="grid md:grid-cols-2 gap-4 mb-4">
+  <div class="bg-white border border-slate-200 rounded-xl px-4 py-4">
+    <h3 class="text-sm font-semibold mb-1">SKUs que mais saíram</h3>
+    <p class="text-xs text-slate-400 mb-4">Por unidades no período</p>
+    {% set maior_sku = d.skus[0].n if d.skus else 1 %}
+    <div class="flex flex-col gap-3">
+      {% for s in d.skus %}
+      <div>
+        <div class="flex justify-between text-xs mb-1 gap-3">
+          <span class="text-slate-600 truncate font-mono">{{ s.sku }}</span>
+          <span class="font-semibold tabular-nums whitespace-nowrap">{{ s.n }} un</span>
+        </div>
+        <div class="h-2 bg-slate-100 rounded-full overflow-hidden">
+          <div class="h-full rounded-full" style="width: {{ (s.n * 100 / maior_sku)|round(1) }}%; background: #2a78d6;"></div>
+        </div>
+      </div>
+      {% else %}
+      <p class="text-sm text-slate-400">Sem itens no período.</p>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="bg-white border border-slate-200 rounded-xl px-4 py-4">
+    <h3 class="text-sm font-semibold mb-1">Expedição × Full</h3>
+    <p class="text-xs text-slate-400 mb-3">Quanto do volume passa pelo galpão</p>
+    {% set exp = d.origem.get("Expedição", 0) %}
+    {% set full = d.origem.get("Full", 0) %}
+    {% set analise = d.origem.get("Em análise", 0) %}
+    {% set soma = exp + full + analise %}
+    {% if soma %}
+    <div class="flex h-8 rounded-lg overflow-hidden gap-0.5 mb-3">
+      {% if exp %}<div class="flex items-center justify-center text-white text-xs font-semibold"
+             style="width: {{ (exp * 100 / soma)|round(2) }}%; background: #2a78d6;">{{ exp }}</div>{% endif %}
+      {% if full %}<div class="flex items-center justify-center text-white text-xs font-semibold"
+             style="width: {{ (full * 100 / soma)|round(2) }}%; background: #eb6834;">{{ full }}</div>{% endif %}
+      {% if analise %}<div class="flex items-center justify-center text-white text-xs font-semibold"
+             style="width: {{ (analise * 100 / soma)|round(2) }}%; background: #fab219;">{{ analise }}</div>{% endif %}
+    </div>
+    <p class="text-xs text-slate-500 mb-5">
+      {{ (exp * 100 / soma)|round(1) }}% do volume é separado aqui dentro.
+      {% if full %}Os {{ full }} pedidos Full o Mercado Livre despacha sozinho.{% endif %}
+    </p>
+    {% else %}
+    <p class="text-sm text-slate-400 mb-5">Sem vendas no período.</p>
+    {% endif %}
+
+    <h3 class="text-sm font-semibold mb-1">Tempo de ciclo</h3>
+    <p class="text-xs text-slate-400 mb-3">Mediana no período selecionado</p>
+    {% set c = d.ciclo %}
+    {% if c.ate_impressao is not none or c.total_horas is not none %}
+    <div class="flex flex-col gap-2 text-xs">
+      <div class="flex justify-between">
+        <span class="text-slate-600">Venda → etiqueta impressa</span>
+        <span class="font-semibold tabular-nums">
+          {% if c.ate_impressao is not none %}{{ c.ate_impressao }} h{% else %}—{% endif %}
+        </span>
+      </div>
+      <div class="flex justify-between">
+        <span class="text-slate-600">Etiqueta → despacho</span>
+        <span class="font-semibold tabular-nums">
+          {% if c.impressao_ate_envio is not none %}{{ c.impressao_ate_envio }} h{% else %}—{% endif %}
+        </span>
+      </div>
+      <div class="flex justify-between border-t border-slate-100 pt-2">
+        <span class="text-slate-700 font-medium">Venda → despacho</span>
+        <span class="font-semibold tabular-nums">
+          {% if c.total_horas is not none %}{{ c.total_horas }} h{% else %}—{% endif %}
+        </span>
+      </div>
+    </div>
+    <p class="text-xs text-slate-400 mt-3">
+      Baseado em {{ c.com_envio }} de {{ c.total }} pedidos do período — só entram os que
+      têm o horário registrado.
+    </p>
+    {% else %}
+    <p class="text-sm text-slate-400">
+      Nenhum pedido do período tem horário de impressão ou despacho registrado.
+    </p>
+    {% endif %}
+  </div>
+</div>
+
+<div class="bg-white border border-slate-200 rounded-xl px-4 py-4">
+  <div class="flex items-baseline justify-between gap-3 mb-3 flex-wrap">
+    <div>
+      <h3 class="text-sm font-semibold">Precisa de atenção</h3>
+      <p class="text-xs text-slate-400">Passaram do prazo de despacho e ainda não saíram — de qualquer data, não só do período filtrado</p>
+    </div>
+    <a href="/gerente" class="text-xs text-slate-500 hover:text-slate-900 underline">Ver no Pedidos →</a>
+  </div>
+  {% if d.atrasados %}
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="text-left text-xs uppercase tracking-wide text-slate-400 border-b border-slate-100">
+          <th class="px-2 py-2">ID Expedição</th>
+          <th class="px-2 py-2">Loja</th>
+          <th class="px-2 py-2">Itens</th>
+          <th class="px-2 py-2">Prazo</th>
+          <th class="px-2 py-2">Atraso</th>
+          <th class="px-2 py-2">Situação</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for a in d.atrasados %}
+        <tr class="border-b border-slate-100 last:border-0">
+          <td class="px-2 py-2 font-mono">{{ a.id_exped or "—" }}</td>
+          <td class="px-2 py-2">{{ a.empresa }}</td>
+          <td class="px-2 py-2 tabular-nums">{{ a.n_itens }}</td>
+          <td class="px-2 py-2 tabular-nums">{{ a.data_limite }}</td>
+          <td class="px-2 py-2 tabular-nums">{{ a.dias }} dia{{ "s" if a.dias != 1 else "" }}</td>
+          <td class="px-2 py-2">
+            <span class="text-xs px-2 py-0.5 rounded-full
+                         {% if a.dias > 1 %}bg-red-100 text-red-800{% else %}bg-amber-100 text-amber-800{% endif %}">
+              {{ a.status }}
+            </span>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="text-sm text-slate-500">Nenhum pedido atrasado no período. 🎉</p>
+  {% endif %}
+</div>
+
+{% if d.serie.dias %}
+<script>
+(function () {
+  var dados = {{ serie_json|safe }};
+  var CORES_LOJA = {{ cores_json|safe }};
+  var RESERVA = ["#2a78d6", "#eb6834", "#1baf7a"];
+  function corDaLoja(nome, i) { return CORES_LOJA[nome] || RESERVA[i % RESERVA.length]; }
+  var svg = document.getElementById("svg-vendas");
+  var plot = document.getElementById("plot-vendas");
+  var tip = document.getElementById("tip-vendas");
+  if (!svg || !dados.dias.length) return;
+
+  var NS = "http://www.w3.org/2000/svg";
+  var W = 720, H = 240, ml = 34, mr = 10, mt = 10, mb = 26;
+  var pw = W - ml - mr, ph = H - mt - mb;
+
+  var maxV = 1;
+  dados.lojas.forEach(function (l) {
+    l.valores.forEach(function (v) { if (v > maxV) maxV = v; });
+  });
+  // Teto "redondo" pra escala não terminar num número quebrado.
+  var passo = maxV <= 5 ? 1 : (maxV <= 20 ? 5 : (maxV <= 50 ? 10 : 20));
+  var topo = Math.ceil(maxV / passo) * passo;
+
+  var n = dados.dias.length;
+  function x(i) { return n === 1 ? ml + pw / 2 : ml + (pw * i) / (n - 1); }
+  function y(v) { return mt + ph - (ph * v) / topo; }
+  function el(t, a) {
+    var e = document.createElementNS(NS, t);
+    for (var k in a) e.setAttribute(k, a[k]);
+    return e;
+  }
+
+  for (var v = 0; v <= topo; v += passo) {
+    svg.appendChild(el("line", { x1: ml, x2: W - mr, y1: y(v), y2: y(v),
+      stroke: "#e8ecf1", "stroke-width": 1 }));
+    var rot = el("text", { x: ml - 8, y: y(v) + 4, "text-anchor": "end",
+      fill: "#94a3b8", "font-size": 11 });
+    rot.textContent = v;
+    svg.appendChild(rot);
+  }
+
+  // Com muitos dias, rotula um sim outro não pra não colidir.
+  var salto = Math.ceil(n / 10);
+  dados.dias.forEach(function (dia, i) {
+    if (i % salto !== 0 && i !== n - 1) return;
+    var t = el("text", { x: x(i), y: H - 7, "text-anchor": "middle",
+      fill: "#94a3b8", "font-size": 11 });
+    t.textContent = dia;
+    svg.appendChild(t);
+  });
+
+  dados.lojas.forEach(function (l, k) {
+    var cor = corDaLoja(l.nome, k);
+    if (n === 1) {
+      svg.appendChild(el("circle", { cx: x(0), cy: y(l.valores[0]), r: 4.5,
+        fill: cor, stroke: "#fff", "stroke-width": 2 }));
+      return;
+    }
+    var d = l.valores.map(function (v, i) { return (i ? "L" : "M") + x(i) + " " + y(v); }).join(" ");
+    svg.appendChild(el("path", { d: d, fill: "none", stroke: cor, "stroke-width": 2,
+      "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    svg.appendChild(el("circle", { cx: x(n - 1), cy: y(l.valores[n - 1]), r: 4.5,
+      fill: cor, stroke: "#fff", "stroke-width": 2 }));
+  });
+
+  var guia = el("line", { x1: 0, x2: 0, y1: mt, y2: mt + ph, stroke: "#94a3b8",
+    "stroke-width": 1, "stroke-dasharray": "3 3", opacity: 0 });
+  svg.appendChild(guia);
+  var marcas = dados.lojas.map(function (l, k) {
+    var c = el("circle", { r: 4.5, fill: corDaLoja(l.nome, k), stroke: "#fff",
+      "stroke-width": 2, opacity: 0 });
+    svg.appendChild(c);
+    return c;
+  });
+
+  dados.dias.forEach(function (_, i) {
+    var largura = n === 1 ? pw : pw / (n - 1);
+    var faixa = el("rect", { x: x(i) - largura / 2, y: mt, width: largura, height: ph,
+      fill: "transparent", style: "cursor:crosshair" });
+    faixa.addEventListener("mouseenter", function () {
+      guia.setAttribute("x1", x(i));
+      guia.setAttribute("x2", x(i));
+      guia.setAttribute("opacity", 1);
+      var total = 0, linhas = "";
+      dados.lojas.forEach(function (l, k) {
+        marcas[k].setAttribute("cx", x(i));
+        marcas[k].setAttribute("cy", y(l.valores[i]));
+        marcas[k].setAttribute("opacity", 1);
+        total += l.valores[i];
+        linhas += '<div class="flex justify-between gap-4 text-slate-600">' +
+          '<span><span class="inline-block w-2 h-2 rounded-full align-middle" style="background:' +
+          corDaLoja(l.nome, k) + '"></span> ' + l.nome +
+          '</span><b class="text-slate-900 tabular-nums">' + l.valores[i] + "</b></div>";
+      });
+      tip.innerHTML = '<div class="font-semibold mb-1">' + dados.dias[i] + "</div>" + linhas +
+        '<div class="flex justify-between gap-4 mt-1 pt-1 border-t border-slate-100">' +
+        '<span>Total</span><b class="tabular-nums">' + total + "</b></div>";
+      var caixa = plot.getBoundingClientRect();
+      var px = (x(i) / W) * caixa.width;
+      tip.style.opacity = 1;
+      tip.style.left = Math.min(Math.max(px - 70, 0), caixa.width - 160) + "px";
+      tip.style.top = "6px";
+    });
+    svg.appendChild(faixa);
+  });
+
+  svg.addEventListener("mouseleave", function () {
+    guia.setAttribute("opacity", 0);
+    marcas.forEach(function (m) { m.setAttribute("opacity", 0); });
+    tip.style.opacity = 0;
+  });
+})();
+</script>
+{% endif %}

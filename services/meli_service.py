@@ -27,6 +27,106 @@ ORIGEM_FULL = "Full"
 ORIGEM_INDEFINIDA = "Em análise"
 
 
+def _logistic_type(sh: dict) -> str:
+    """Tipo logístico do envio, nos DOIS formatos que o ML devolve: `logistic_type`
+    na raiz (vista atual) e `logistic.type` (vista nova, obrigatória a partir do fim
+    de setembro/2026). Mesmo valor, endereços diferentes — ler os dois evita que a
+    classificação de Full pare de funcionar no dia da virada."""
+    sh = sh or {}
+    return sh.get("logistic_type") or (sh.get("logistic") or {}).get("type") or ""
+
+
+def _envio_de_ida(dados) -> dict:
+    """O envio de IDA em /orders/{id}/shipments, que responde ora um objeto, ora um
+    array — e a doc do ML avisa pra não assumir a ordem do array. Procura por tipo;
+    devolve {} quando não há envio nenhum."""
+    if isinstance(dados, list):
+        return next((e for e in dados if (e or {}).get("type") == "forward"),
+                    dados[0] if dados else {}) or {}
+    return dados or {}
+
+# Etapa física de uma devolução, na linguagem do galpão. São só estas cinco: a API do
+# ML tem 14 status de devolução e ~40 substatus de envio não entregue, e distinguir
+# todos eles na tela não muda nada do que a expedição faz.
+FASE_PREPARANDO = "Em preparação"     # existe, ainda não saiu da mão do comprador
+FASE_A_CAMINHO = "A caminho"
+FASE_CHEGOU = "Chegou"                # está no galpão, esperando conferência
+FASE_ENCERRADA = "Encerrada"          # cancelada/expirada/perdida — não vem mais nada
+FASE_DESCONHECIDA = "Não verificado"  # a consulta falhou; NUNCA é um palpite
+
+# Devolução do comprador — status de /post-purchase/v2/claims/{id}/returns.
+_FASE_POR_STATUS_RETURN = {
+    "pending": FASE_PREPARANDO,
+    "label_generated": FASE_PREPARANDO,
+    "scheduled": FASE_PREPARANDO,
+    "failed": FASE_ENCERRADA,
+    "pending_failure": FASE_ENCERRADA,
+    "shipped": FASE_A_CAMINHO,
+    "pending_delivered": FASE_A_CAMINHO,
+    "delivered": FASE_CHEGOU,
+    "not_delivered": FASE_ENCERRADA,
+    "return_to_buyer": FASE_ENCERRADA,
+    "cancelled": FASE_ENCERRADA,
+    "pending_cancel": FASE_ENCERRADA,
+    "expired": FASE_ENCERRADA,
+    "pending_expiration": FASE_ENCERRADA,
+}
+
+# Retorno sem entrega — substatus de /shipments/{id} com status "not_delivered".
+# Só duas listas explícitas; o resto sai por regra (ver `fase_do_retorno`), senão
+# seriam 40 nomes pra manter sincronizados com o ML à mão.
+_SUBSTATUS_CHEGOU = {"returned"}
+_SUBSTATUS_PERDIDO = {
+    "destroyed", "stolen", "lost", "confiscated", "not_recovered", "unclaimed",
+    "return_failed", "detained_at_customs", "detained_at_origin",
+}
+
+
+DESTINO_NOSSO = "seller_address"      # o pacote volta pro galpão do vendedor
+DESTINO_ML = "warehouse"              # o pacote vai pro depósito do Mercado Livre
+
+
+def _destino_da_devolucao(detail: dict) -> str | None:
+    """Pra onde o pacote da devolução está indo, lido do envio de volta.
+
+    `shipments` pode trazer mais de um envio (`return` pro vendedor,
+    `return_from_triage` do depósito pra uma revisão intermediária), então o envio
+    de volta é procurado por tipo em vez de assumir que é o primeiro — a própria doc
+    do ML avisa pra não assumir ordem de array em /orders/{id}/shipments."""
+    envios = (detail or {}).get("shipments") or []
+    if not isinstance(envios, list):
+        return None
+    alvo = next((e for e in envios if (e or {}).get("type") == "return"), None)
+    if alvo is None:
+        alvo = envios[0] if envios else None
+    return ((alvo or {}).get("destination") or {}).get("name") or None
+
+
+def fase_do_retorno(sh: dict) -> str:
+    """Etapa de um pacote que voltou sem ser entregue, a partir do envio ORIGINAL.
+
+    Não existe claim nesse fluxo (ninguém reclamou — a entrega é que não aconteceu),
+    então toda a API de devoluções, que é indexada por claim_id, não se aplica aqui:
+    é o shipment que carrega a volta. Foi o que faltou em 11/08/2026, quando o card
+    ficou preso em "Em preparação" porque consultávamos um claim inventado.
+
+    A ordem dos testes importa: `return_failed` tem "return" no nome mas é perda, não
+    retorno em andamento, então a lista de perdidos é checada antes da regra geral."""
+    status = (sh or {}).get("status") or ""
+    substatus = (sh or {}).get("substatus") or ""
+    if status == "delivered":
+        return FASE_ENCERRADA          # foi entregue afinal; não volta pro galpão
+    if status != "not_delivered":
+        return FASE_A_CAMINHO          # ainda em trânsito normal
+    if substatus in _SUBSTATUS_PERDIDO:
+        return FASE_ENCERRADA
+    if substatus in _SUBSTATUS_CHEGOU:
+        return FASE_CHEGOU
+    if "return" in substatus:
+        return FASE_A_CAMINHO          # returning_to_sender, returned_to_hub, etc.
+    return FASE_A_CAMINHO
+
+
 def _fmt_date_br(iso: str) -> str:
     """Formata uma data ISO do ML em DD/MM/AAAA no fuso de Brasília (evita erro de 1 dia)."""
     if not iso:
@@ -262,12 +362,18 @@ class MeliService:
                 await self.token_store.update_tokens(self.user_id, self._access_token, self._refresh_token)
             return self._access_token
 
-    async def _get(self, path: str, params: dict | None = None) -> dict:
+    async def _get(self, path: str, params: dict | None = None,
+                    headers: dict | None = None) -> dict:
+        """`headers` acrescenta cabeçalhos aos de autenticação — o ML tem recursos que
+        exigem os seus (`x-format-new`, `X-New-Domain`). Remontados após o refresh,
+        senão a segunda tentativa iria sem eles e voltaria no formato errado."""
+        def _h() -> dict:
+            return {**self._headers(), **(headers or {})}
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
-            resp = await client.get(f"{MELI_API}{path}", headers=self._headers(), params=params)
+            resp = await client.get(f"{MELI_API}{path}", headers=_h(), params=params)
             if resp.status_code == 401:
                 await self.refresh_token()
-                resp = await client.get(f"{MELI_API}{path}", headers=self._headers(), params=params)
+                resp = await client.get(f"{MELI_API}{path}", headers=_h(), params=params)
             resp.raise_for_status()
             return resp.json()
 
@@ -278,14 +384,20 @@ class MeliService:
         self.user_id = str(data["id"])
         return self.user_id
 
-    async def _post(self, path: str, json_body: dict) -> dict:
-        async with httpx.AsyncClient() as client:
+    async def _post(self, path: str, json_body) -> dict:
+        """`json_body` pode ser dict ou list — o ML usa array em return-review.
+        Resposta sem corpo (o 200 vazio que algumas rotas devolvem) vira {} em vez de
+        estourar no parser: o que importa nesses casos é o status, não o conteúdo."""
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
             resp = await client.post(f"{MELI_API}{path}", headers=self._headers(), json=json_body)
             if resp.status_code == 401:
                 await self.refresh_token()
                 resp = await client.post(f"{MELI_API}{path}", headers=self._headers(), json=json_body)
             resp.raise_for_status()
-            return resp.json()
+            try:
+                return resp.json()
+            except ValueError:
+                return {}
 
     async def get_all_items(self) -> list[dict]:
         """Retorna todos os anúncios ativos da loja."""
@@ -467,34 +579,146 @@ class MeliService:
         separada do claim em si, só existe pra claims do tipo "returns"."""
         return await self._get(f"/post-purchase/v2/claims/{claim_id}/returns")
 
-    async def get_devolucao_fase(self, claim_id: str) -> str:
-        """Fase física da devolução, pro claim ainda ABERTO (não chamar depois de
-        fechado — nesse caso a fase já é "Concluído", direto do status do claim,
-        sem precisar desta consulta extra). Mapeamento (confirmado ao vivo em
-        2 casos reais): status "label_generated" = etiqueta gerada, comprador ainda
-        não postou = "Em preparação"; "delivered" = chegou fisicamente = "A revisar".
-        Qualquer outro status observado (ainda não vimos um caso real passando por
-        "postado"/"em trânsito") cai no fallback "A caminho"."""
+    async def revisao_liberada(self, claim_id: str) -> bool:
+        """O ML já permite revisar esta devolução?
+
+        A doc manda checar em /claims/{id}: no array `players`, o de `type == "seller"`
+        precisa ter `return_review_ok` entre as `available_actions`. A ação só aparece
+        depois que o pacote consta como entregue ao vendedor — e some quando o prazo
+        vence ou a reclamação encerra. É a diferença entre "posso revisar" e "acho que
+        posso"."""
+        try:
+            claim = await self.get_claim(claim_id)
+        except Exception as e:
+            logger.warning("revisao_liberada: claim %s falhou (%s)", claim_id, e)
+            return False
+        for player in (claim.get("players") or []):
+            if (player or {}).get("type") != "seller":
+                continue
+            for acao in (player.get("available_actions") or []):
+                # O ML manda ora objetos {"action": "..."} ora a string solta.
+                nome = acao.get("action") if isinstance(acao, dict) else acao
+                if nome == "return_review_ok":
+                    return True
+        return False
+
+    async def revisao_ja_enviada(self, return_id: str) -> bool:
+        """Já existe revisão registrada pro vendedor nesta devolução?
+
+        Usado pra não tratar como falha o clique repetido: se a revisão já está lá, não
+        há nada a enviar e a baixa pode ser gravada. `seller_status` preenchido é o
+        sinal — vale tanto pra revisão que o vendedor fez quanto pra que o ML resolveu
+        sozinho no vencimento; nos dois casos não resta ação nossa no ML."""
+        try:
+            dados = await self._get(f"/post-purchase/v1/returns/{return_id}/reviews")
+        except Exception:
+            return False   # 404 = nenhuma revisão ainda
+        for review in (dados or {}).get("reviews") or []:
+            for item in (review or {}).get("resource_reviews") or []:
+                if (item or {}).get("seller_status"):
+                    return True
+        return False
+
+    async def revisar_devolucao_ok(self, return_id: str) -> None:
+        """Diz ao ML que o produto voltou nas condições esperadas.
+
+        O corpo é uma LISTA VAZIA. A doc do ML mostra `-d '{}'` pra revisão OK, e isso
+        está errado: medido em produção em 21/08/2026 no return 156106684, `{}` responde
+        400 "Required request body is missing or incorrect" e `[]` responde 201
+        {"status":"completed"} — com a revisão aparecendo em /reviews logo depois. Faz
+        sentido: o endpoint é o unificado (as `available_actions` do claim trazem
+        `return_review_unified_ok`) e o fluxo com falha também usa array, com um item
+        por pedido. Revisão OK é o mesmo array, sem itens.
+
+        Revisão COM falha continua no painel do ML: exige razão padronizada (SRF2-SRF7),
+        mensagem e, pra algumas razões, foto anexada.
+
+        Levanta se o ML recusar: quem chama precisa saber que não passou, porque é isso
+        que decide se a baixa é gravada aqui (ver routers/mural.py)."""
+        await self._post(f"/post-purchase/v1/returns/{return_id}/return-review", [])
+
+    async def estado_da_devolucao(self, claim_id: str) -> dict:
+        """Fase + destino + return_id de uma devolução do comprador, numa consulta só.
+
+        `destino` responde a pergunta que decide se o card faz sentido pra expedição:
+        o pacote vem PRA CÁ ou vai pro depósito do ML? A doc de devoluções lista
+        `destination.name` como `seller_address` (destino vendedor) ou `warehouse`
+        (depósito do Mercado Livre) — e nós ignorávamos o campo, então uma devolução
+        endereçada ao ML aparecia no Mural pedindo que alguém confirmasse o
+        recebimento de um pacote que nunca chegaria no galpão.
+
+        `return_id` (o `id` do objeto de devolução) é guardado porque é ele, não o
+        claim_id, que qualquer ação futura no ML exige — revisão da devolução,
+        anexo de foto. Sem guardar, seria uma consulta a mais toda vez.
+
+        Erro de consulta devolve FASE_DESCONHECIDA: um timeout não é informação, e
+        tratá-lo como "Em preparação" é o mesmo erro que deixou um pedido Full vazar
+        pro Mural em agosto."""
         try:
             detail = await self.get_return_detail(claim_id)
-        except Exception:
-            return "Em preparação"
-        status = (detail or {}).get("status", "")
-        if status == "label_generated":
-            return "Em preparação"
-        if status == "delivered":
-            return "A revisar"
-        return "A caminho"
+        except Exception as e:
+            logger.warning("estado_da_devolucao: claim %s falhou (%s)", claim_id, e)
+            return {"fase": FASE_DESCONHECIDA, "destino": None, "return_id": None}
+        detail = detail or {}
+        # A doc mostra um objeto; se um dia vier lista (o ML já fez isso em
+        # /orders/{id}/shipments), pega o primeiro em vez de estourar.
+        if isinstance(detail, list):
+            detail = detail[0] if detail else {}
+        return {
+            "fase": self._fase_do_status_return(detail.get("status") or ""),
+            "destino": _destino_da_devolucao(detail),
+            "return_id": str(detail.get("id")) if detail.get("id") is not None else None,
+            "status_ml": detail.get("status") or None,
+        }
+
+    @staticmethod
+    def _fase_do_status_return(status: str) -> str:
+        """Os 14 status documentados viram fase; qualquer outro vira "Não verificado".
+
+        Antes o padrão era FASE_A_CAMINHO — ou seja, status que o ML inventasse
+        depois viraria a AFIRMAÇÃO de que o pacote está a caminho. Não saber tem que
+        parecer não saber."""
+        if not status:
+            return FASE_DESCONHECIDA
+        return _FASE_POR_STATUS_RETURN.get(status, FASE_DESCONHECIDA)
+
+    async def get_devolucao_fase(self, claim_id: str) -> str:
+        """Só a fase (ver `estado_da_devolucao`, que traz também destino e return_id)."""
+        return (await self.estado_da_devolucao(claim_id))["fase"]
 
     async def get_shipment(self, shipping_id: str) -> dict:
         return await self._get(f"/shipments/{shipping_id}")
+
+    async def get_shipment_history(self, shipping_id: str) -> list[dict]:
+        """Histórico de status/substatus do envio, cada um com a sua data.
+
+        É a única fonte da data em que o pacote realmente voltou — `criado_em` da
+        devolução é o instante em que NÓS registramos, que pode ser dias depois."""
+        data = await self._get(f"/shipments/{shipping_id}/history")
+        return data if isinstance(data, list) else []
+
+    async def data_de_retorno(self, shipping_id: str) -> datetime | None:
+        """Quando o envio passou a "voltou pro vendedor". None se ainda não voltou
+        ou se o histórico não estiver disponível — nunca inventa uma data."""
+        try:
+            historico = await self.get_shipment_history(shipping_id)
+        except Exception as e:
+            logger.warning("data_de_retorno: histórico de %s falhou (%s)", shipping_id, e)
+            return None
+        for evento in historico:
+            if (evento.get("substatus") or "") in _SUBSTATUS_CHEGOU:
+                try:
+                    return datetime.fromisoformat((evento.get("date") or "").replace("Z", "+00:00"))
+                except ValueError:
+                    return None
+        return None
 
     def origem_do_shipment(self, sh: dict) -> str:
         """Classifica a origem a partir de um shipment JÁ buscado — sem chamada nova.
         `logistic_type == "fulfillment"` é Mercado Envios Full: o próprio centro de
         distribuição do ML separa, embala e despacha, então esses pedidos nunca podem
         entrar no Mural/Embalagem/Gaiolas do nosso galpão."""
-        return ORIGEM_FULL if sh.get("logistic_type") == "fulfillment" else ORIGEM_EXPEDICAO
+        return ORIGEM_FULL if _logistic_type(sh) == "fulfillment" else ORIGEM_EXPEDICAO
 
     async def detectar_origem(self, order: dict) -> str:
         """Origem do pedido: ORIGEM_FULL, ORIGEM_EXPEDICAO ou ORIGEM_INDEFINIDA.
@@ -505,17 +729,51 @@ class MeliService:
         2000014377469389 foi gravado como Expedição, aparecendo no Mural sem que nada
         depois o corrigisse. Agora a dúvida vira ORIGEM_INDEFINIDA e o webhook de
         shipments a resolve minutos depois — nada é adivinhado."""
+        order_id = order.get("id")
         shipping_id = (order.get("shipping") or {}).get("id")
         if not shipping_id:
-            # Envio ainda não atribuído (webhook costuma chegar segundos após a venda).
-            return ORIGEM_INDEFINIDA
+            return await self._origem_pelo_pedido(order_id)
         try:
             sh = await self.get_shipment(str(shipping_id))
         except Exception as e:
-            logger.warning("detectar_origem: shipment %s falhou (%s) — origem fica '%s'",
-                           shipping_id, e, ORIGEM_INDEFINIDA)
+            logger.warning("detectar_origem: order %s shipment %s falhou (%s) — origem fica '%s'",
+                           order_id, shipping_id, e, ORIGEM_INDEFINIDA)
             return ORIGEM_INDEFINIDA
-        return self.origem_do_shipment(sh)
+        origem = self.origem_do_shipment(sh)
+        logger.info("detectar_origem: order %s shipment %s logistic_type=%s -> %s",
+                    order_id, shipping_id, _logistic_type(sh), origem)
+        return origem
+
+    async def _origem_pelo_pedido(self, order_id) -> str:
+        """Origem quando o pedido chegou SEM `shipping.id`: pergunta o envio ao ML
+        pelo próprio pedido, em vez de desistir na hora.
+
+        Em 23/08/2026 a venda 2000018079144400 nasceu "Em análise" e ficou dois dias
+        assim, embora o envio 47837827168 já existisse havia 57 segundos — ele só não
+        estava pendurado no pedido quando o lemos. `/orders/{id}/shipments` responde o
+        envio de ida com o `logistic_type` dentro, então uma chamada resolve.
+
+        Continua sem chutar: envio inexistente (404) ou resposta sem tipo logístico
+        devolve ORIGEM_INDEFINIDA, e o webhook de shipments resolve depois."""
+        if not order_id:
+            return ORIGEM_INDEFINIDA
+        try:
+            dados = await self._get(f"/orders/{order_id}/shipments",
+                                    headers={"X-New-Domain": "true"})
+        except Exception as e:
+            logger.info("detectar_origem: order %s ainda sem envio (%s) -> %s",
+                        order_id, e, ORIGEM_INDEFINIDA)
+            return ORIGEM_INDEFINIDA
+        sh = _envio_de_ida(dados)
+        tipo = _logistic_type(sh)
+        if not tipo:
+            logger.info("detectar_origem: order %s respondeu envio sem tipo logístico -> %s",
+                        order_id, ORIGEM_INDEFINIDA)
+            return ORIGEM_INDEFINIDA
+        origem = self.origem_do_shipment(sh)
+        logger.info("detectar_origem: order %s resolvido pelo pedido, logistic_type=%s -> %s",
+                    order_id, tipo, origem)
+        return origem
 
     async def get_label_zpl(self, shipping_id: str) -> str:
         """Retorna o ZPL da etiqueta de envio do ML (descompactado). Lança em erro."""
@@ -650,33 +908,42 @@ class MeliService:
         return out
 
     async def get_delivery_deadline(self, order: dict) -> str:
-        """Retorna o prazo de DESPACHO (DD/MM/AAAA) — o "despachar até" que o ML cobra.
+        """Retorna o prazo de DESPACHO (DD/MM/AAAA) — o "despachar até" que o ML cobra —
+        ou "" quando o ML ainda não sabe dizer.
 
-        Usa o SLA dedicado do envio (`/shipments/{id}/sla` → expected_date), que é o
-        mesmo prazo do painel. Se falhar, cai na data de entrega ao cliente (fallback).
-        """
+        Vem do SLA dedicado do envio (`/shipments/{id}/sla` → expected_date), o mesmo
+        prazo que aparece no painel do vendedor.
+
+        Até 19/08/2026, quando o SLA respondia 404 (o normal nos primeiros minutos de
+        vida do envio) isto caía num fallback que gravava a data de ENTREGA AO
+        COMPRADOR como se fosse prazo de despacho. São coisas diferentes e o erro era
+        sempre pra mais: a venda 2000014601305665 ficou com 25/08 quando o despacho
+        vencia 19/08. Um prazo folgado e plausível é pior que prazo nenhum — joga o
+        pedido pra "Próximos envios" no Mural e trava o gatilho de NF-e (que só dispara
+        com `data_limite <= hoje`), sem ninguém perceber. Agora, na dúvida, devolve ""
+        — o Mural trata pedido sem data como urgente, e `revalidar_prazos_pendentes`
+        (sync_service) pergunta de novo a cada rodada até o ML responder.
+
+        Sem exceção pra Full (decidido em 20/08/2026). O ML não calcula SLA pra
+        logística Fulfillment, e por um tempo isto devolvia a estimativa de ENTREGA
+        nesses casos — "melhor alguma coisa do que nada". Mas o campo é o prazo de
+        DESPACHO: pôr entrega ali é a mesma mentira de origem, só menor. Pedido Full
+        é despachado pelo CD do ML, não por nós; ele não tem prazo nosso de despacho,
+        e agora o campo diz isso ficando vazio. Full também não entra no Mural (ver
+        `vendas_db.get_mural_pedidos`), então isso não deixa ninguém sem informação
+        de trabalho.
+
+        A doc de envios fecha a questão: "A partir de 13 de maio de 2025 se deprecia
+        o campo estimated_handling_limit e a informação só poderá ser consumida no
+        recurso de SLA". Prazo de despacho tem uma fonte só."""
         shipping_id = (order.get("shipping") or {}).get("id")
         if not shipping_id:
             return ""
-        # 1) Prazo de despacho ("despachar até") — SLA do envio
         try:
             sla = await self._get(f"/shipments/{shipping_id}/sla")
-            if sla.get("expected_date"):
-                return _fmt_date_br(sla["expected_date"])
-        except Exception:
-            pass
-        # 2) Fallback: entrega ao cliente (comportamento antigo)
-        try:
-            sh = await self.get_shipment(shipping_id)
         except Exception:
             return ""
-        opt = sh.get("shipping_option") or {}
-        raw = (
-            (opt.get("estimated_delivery_limit") or {}).get("date")
-            or (opt.get("estimated_delivery_time") or {}).get("date")
-            or (opt.get("estimated_delivery_final") or {}).get("date")
-        )
-        return _fmt_date_br(raw)
+        return _fmt_date_br(sla.get("expected_date") or "")
 
     async def get_recent_orders(self, max_orders: int = 50) -> list[dict]:
         """Busca os pedidos pagos mais recentes da loja (para backfill)."""

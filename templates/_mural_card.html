@@ -8,7 +8,7 @@
     <label class="flex items-center gap-2 cursor-pointer">
       <input type="checkbox" class="pedido-check rounded border-slate-400"
              data-venda="{{ p.venda }}" data-empresa="{{ p.empresa }}">
-      <span>Entrega até {{ p.data_limite or "—" }}</span>
+      <span>{% if p.data_limite %}Entrega até {{ p.data_limite }}{% else %}Prazo a confirmar{% endif %}</span>
     </label>
     {% endif %}
     <span class="font-mono text-slate-300">{{ p.id_exped or "—" }}</span>

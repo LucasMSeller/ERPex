@@ -225,8 +225,12 @@ async def preparar_separacao(body: PrepararSeparacaoIn, background_tasks: Backgr
 
     # Gatilho de NF-e: só faz sentido tentar se a entrega for hoje — antes disso o
     # ML ainda não libera a emissão (mesma regra que libera a etiqueta do ML).
+    # Pedido SEM prazo conta como hoje: desde 19/08/2026 `data_limite` fica vazio
+    # enquanto o ML não devolve o SLA, e o Mural já joga esses em "Hoje". Se o
+    # gatilho ignorasse, o pedido seria separado com a etiqueta travada em
+    # "invoice_pending" — justamente o que a nota resolve.
     data_limite = _parse_data_br(pedido.get("data_limite"))
-    if data_limite is not None and data_limite <= date.today():
+    if data_limite is None or data_limite <= date.today():
         background_tasks.add_task(_gatilho_nf, body.company, body.venda)
 
     zpl = build_separacao_zpl(pedido)
@@ -254,8 +258,11 @@ async def preparar_separacao_lote(body: VendasIn, background_tasks: BackgroundTa
     pedidos = []
     faltando = []
     cancelados = []
+    # Uma consulta pro lote inteiro — buscar venda a venda custava uma ida ao banco
+    # por etiqueta, e o lote existe justamente pra imprimir muitas de uma vez.
+    encontrados = await vendas_db.get_pedidos_por_venda(vendas_pedidas)
     for v in vendas_pedidas:
-        pedido = await vendas_db.get_pedido_by_venda(v)
+        pedido = encontrados.get(v)
         if not pedido:
             faltando.append(v)
         elif pedido["status"].strip().lower() == "cancelado":
@@ -270,7 +277,7 @@ async def preparar_separacao_lote(body: VendasIn, background_tasks: BackgroundTa
     # até a nota existir. Só dispara pros que já entram no dia de entrega.
     for pedido in pedidos:
         data_limite = _parse_data_br(pedido.get("data_limite"))
-        if data_limite is not None and data_limite <= date.today():
+        if data_limite is None or data_limite <= date.today():
             background_tasks.add_task(_gatilho_nf, pedido["empresa"], pedido["venda"])
 
     encontrados = [p["venda"] for p in pedidos]
@@ -288,7 +295,9 @@ async def preparar_separacao_lote(body: VendasIn, background_tasks: BackgroundTa
 async def print_separacao_lote_zpl(venda: list[str] = Query(...)):
     """Baixa o .zpl combinado do lote (sem imprimir nem confirmar nada)."""
     vendas_pedidas = list(dict.fromkeys(v for v in venda if v))
-    pedidos = [p for p in [await vendas_db.get_pedido_by_venda(v) for v in vendas_pedidas] if p]
+    # Mantém a ordem que o operador selecionou — o dict do banco vem ordenado por venda.
+    encontrados = await vendas_db.get_pedidos_por_venda(vendas_pedidas)
+    pedidos = [encontrados[v] for v in vendas_pedidas if v in encontrados]
     if not pedidos:
         raise HTTPException(404, "Nenhum dos pedidos selecionados foi encontrado.")
     zpl = "\n".join(build_separacao_zpl(p) for p in pedidos)

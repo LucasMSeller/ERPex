@@ -48,6 +48,30 @@ async def _process_claim(user_id: str, claim_id: str) -> None:
         logger.exception("Falha ao processar claim %s: %s", claim_id, e)
 
 
+def _claim_id_do_resource(resource: str) -> str:
+    """Extrai o claim_id de um resource de reclamação.
+
+    Duas armadilhas, as duas medidas em produção (19/08/2026):
+
+    1. O tópico é `post_purchase`, não `claims`. Nas notificações reais das lojas
+       não apareceu UMA sequer com tópico "claims" — eram todas "post_purchase", e
+       o `if` antigo comparava com "claims", então TODA devolução por reclamação era
+       descartada em silêncio. O claim 5562216393 (PLG100826001) disparou 12
+       notificações no dia 18/08 e nenhuma foi processada: o pedido virou só
+       "Cancelado", sem o pacote que estava voltando aparecer em lugar nenhum.
+    2. O resource nem sempre termina no id — vem também como
+       `/post-purchase/v1/claims/5562216393/actions-history`. Pegar o último pedaço
+       da URL devolveria "actions-history" no lugar do número.
+
+    Por isso o id é lido como o segmento logo DEPOIS de "claims", não o último."""
+    partes = [p for p in (resource or "").split("/") if p]
+    if "claims" in partes:
+        i = partes.index("claims")
+        if i + 1 < len(partes):
+            return partes[i + 1]
+    return ""
+
+
 def _verify_signature(body: bytes, signature: str | None) -> bool:
     secret = get_settings().webhook_secret
     if not secret or not signature:
@@ -82,8 +106,10 @@ async def ml_webhook(request: Request, background_tasks: BackgroundTasks,
         background_tasks.add_task(_process_shipment, user_id, shipping_id)
         return {"status": "accepted", "shipping_id": shipping_id}
 
-    if topic == "claims":
-        claim_id = resource.split("/")[-1]
+    if topic in ("post_purchase", "claims"):
+        claim_id = _claim_id_do_resource(resource)
+        if not claim_id:
+            return {"status": "ignored", "topic": topic, "resource": resource}
         background_tasks.add_task(_process_claim, user_id, claim_id)
         return {"status": "accepted", "claim_id": claim_id}
 

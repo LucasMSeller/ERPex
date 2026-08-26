@@ -1,3 +1,7 @@
+{# `erros` mapeia claim_id -> motivo pelo qual a baixa NÃO foi gravada. Vem só do
+   POST /recebi; os outros caminhos renderizam sem ele, e sem este default o Jinja
+   estoura e a aba inteira de devoluções some da tela. #}
+{% set erros = erros | default({}) %}
 {% if not devolucoes %}
 <p class="text-slate-400 text-sm">Nenhuma devolução pendente.</p>
 {% endif %}
@@ -13,12 +17,31 @@
     <div class="px-4 py-3 text-sm space-y-1 border-b border-amber-100">
       <p>
         <span class="text-xs px-2 py-0.5 rounded-full
-          {{ 'bg-emerald-100 text-emerald-800' if d.fase == 'A revisar' else 'bg-amber-100 text-amber-800' }}">
+          {% if d.fase == FASE_CHEGOU %}bg-emerald-100 text-emerald-800
+          {% elif d.fase == FASE_ENCERRADA %}bg-slate-100 text-slate-600
+          {% elif d.fase == FASE_DESCONHECIDA %}bg-red-100 text-red-800
+          {% else %}bg-amber-100 text-amber-800{% endif %}">
           {{ d.fase or "Em preparação" }}
         </span>
+        {% if d.retorno_sem_entrega %}
+        <span class="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-600"
+              title="O pacote não foi entregue e voltou. Não houve reclamação do comprador.">
+          Não entregue
+        </span>
+        {% endif %}
+        {% if not d.vem_pra_ca %}
+        <span class="text-xs px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-800"
+              title="O Mercado Livre endereçou esta devolução ao depósito dele, não ao nosso galpão.">
+          Vai pro ML
+        </span>
+        {% endif %}
       </p>
       <p><span class="text-slate-500">Loja:</span> {{ d.empresa or "—" }}</p>
+      {% if d.chegou_em %}
+      <p><span class="text-slate-500">Chegou em:</span> {{ d.chegou_em.strftime("%d/%m/%Y") }}</p>
+      {% else %}
       <p><span class="text-slate-500">Registrado em:</span> {{ d.criado_em.strftime("%d/%m/%Y") if d.criado_em else "—" }}</p>
+      {% endif %}
       {% if d.motivo %}<p><span class="text-slate-500">Motivo:</span> {{ d.motivo }}</p>{% endif %}
     </div>
 
@@ -36,23 +59,76 @@
     </div>
 
     <div class="px-4 pb-4">
-      {% if d.status != "Recebida" %}
-      <div class="bg-emerald-50 rounded-lg px-3 py-2 text-sm">
-        <span class="text-emerald-700 font-medium">Revisão confirmada:</span> {{ d.avaliacao }}
+      {% if erros.get(d.claim_id) %}
+      {# A baixa NÃO foi gravada — o ML recusou a revisão. O card fica na fila. #}
+      <div class="bg-red-50 border border-red-300 rounded-lg px-3 py-2 text-sm mb-2 space-y-1">
+        <p class="text-red-900 font-medium">Não deu pra confirmar no Mercado Livre</p>
+        <p class="text-red-800 text-xs">{{ erros.get(d.claim_id) }}</p>
+        <p class="text-red-700 text-xs">Nada foi dado baixa — a devolução continua aqui na fila.</p>
       </div>
-      {% elif d.fase == "A revisar" %}
-      <form hx-post="/mural/devolucoes/{{ d.claim_id | urlencode }}/avaliar" hx-target="#devolucoes" hx-swap="innerHTML"
-            class="space-y-2">
-        <textarea name="observacao" required rows="2" placeholder="O que foi encontrado no produto?"
-                  class="w-full text-sm rounded-lg border border-slate-300 px-3 py-2"></textarea>
-        <button type="submit" class="block w-full text-center bg-amber-600 text-white rounded-lg py-2 text-sm font-medium hover:bg-amber-700">
-          Confirmar revisão
-        </button>
-      </form>
+      {% endif %}
+      {% if d.status != "Recebida" %}
+        {# Já passou pela expedição. "Problema" continua na tela até o Gerente encerrar. #}
+        {% if "Problema" in (d.avaliacao or "") %}
+        <div class="bg-red-50 border border-red-200 rounded-lg px-3 py-2 text-sm space-y-1">
+          <p class="text-red-800 font-medium">Resolva no painel do Mercado Livre</p>
+          <p class="text-red-700 text-xs">Contestar um produto devolvido com problema exige
+            motivo e foto pelo site do ML. Pedido {{ d.order_id or d.venda_ml or "—" }}.</p>
+          <a href="https://www.mercadolivre.com.br/vendas/lista" target="_blank" rel="noopener"
+             class="inline-block text-xs font-medium text-red-800 underline">Abrir minhas vendas no ML →</a>
+        </div>
+        {% else %}
+        <div class="bg-emerald-50 rounded-lg px-3 py-2 text-sm">
+          <span class="text-emerald-700 font-medium">Conferido:</span> {{ d.avaliacao }}
+        </div>
+        {% endif %}
+
+      {% elif not d.vem_pra_ca %}
+        {# Endereçada ao depósito do ML: não há o que receber aqui. Pedir confirmação
+           de recebimento faria a expedição procurar um pacote que nunca vem — e, pra
+           tirar o card da tela, acabar registrando um recebimento que não houve. #}
+        <div class="bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2 text-sm space-y-1">
+          <p class="text-indigo-900 font-medium">Este pacote não vem pro galpão</p>
+          <p class="text-indigo-800 text-xs">O Mercado Livre endereçou a devolução ao depósito
+            dele. Acompanhe pelo site do ML — pedido {{ d.order_id or d.venda_ml or "—" }}.</p>
+          <a href="https://www.mercadolivre.com.br/vendas/lista" target="_blank" rel="noopener"
+             class="inline-block text-xs font-medium text-indigo-900 underline">Abrir minhas vendas no ML →</a>
+        </div>
+
       {% else %}
-      <span class="block w-full text-center bg-slate-100 text-slate-400 rounded-lg py-2 text-sm font-medium cursor-not-allowed">
-        Aguardando chegar — ainda "{{ d.fase or "Em preparação" }}"
-      </span>
+        {# Os botões NUNCA dependem do ML confirmar a volta. Quem sabe se a caixa
+           está no galpão é quem está olhando pra ela; o ML atrasa, e travar a baixa
+           nesse aviso foi o que prendeu a devolução de 11/08/2026. A fase (chip lá
+           em cima) informa, não manda — só pede confirmação quando discorda. #}
+        {% set confirmado = d.fase == FASE_CHEGOU %}
+        {% if not confirmado %}
+        <p class="text-xs text-slate-500 mb-2">
+          {% if d.fase == FASE_ENCERRADA %}O ML encerrou esta devolução.
+          {% elif d.fase == FASE_DESCONHECIDA %}Não consegui verificar no ML.
+          {% else %}O ML ainda não registrou a chegada.{% endif %}
+          Se o pacote já está aí, pode dar baixa.
+        </p>
+        {% endif %}
+
+        <div class="flex items-stretch gap-2">
+          <form hx-post="/mural/devolucoes/{{ d.claim_id | urlencode }}/recebi"
+                hx-target="#devolucoes" hx-swap="innerHTML" class="flex-1"
+                {% if not confirmado %}hx-confirm="O Mercado Livre ainda não registrou a volta deste pacote. Ele está aí no galpão?"{% endif %}>
+            <button type="submit"
+                    class="w-full rounded-lg py-2 text-sm font-medium
+                    {% if confirmado %}bg-emerald-600 text-white hover:bg-emerald-700
+                    {% else %}bg-white border border-emerald-600 text-emerald-700 hover:bg-emerald-50{% endif %}">
+              Recebi de volta
+            </button>
+          </form>
+          <form hx-post="/mural/devolucoes/{{ d.claim_id | urlencode }}/problema"
+                hx-target="#devolucoes" hx-swap="innerHTML">
+            <button type="submit" title="O produto voltou com problema"
+                    class="h-full px-3 border border-slate-300 text-slate-600 rounded-lg text-xs hover:bg-slate-50">
+              Tive problemas
+            </button>
+          </form>
+        </div>
       {% endif %}
     </div>
   </div>

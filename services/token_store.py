@@ -117,6 +117,22 @@ class TokenStore:
                 cores[l["nickname"]] = cor
         return cores
 
+    async def liberar_order(self, order_id: str) -> bool:
+        """Desfaz a reserva de `claim_order`, liberando o pedido para ser processado
+        de novo. Necessário para reprocessar venda que se perdeu: o webhook reserva o
+        order_id ANTES de gravar, então uma falha no meio (ex.: queda de conexão)
+        deixa a reserva de pé sem venda nenhuma — e toda tentativa seguinte devolve
+        "already_claimed". Retorna True se havia reserva para remover."""
+        conn = await _get_connection()
+        try:
+            row = await conn.fetchrow(
+                f"DELETE FROM {PROCESSED_ORDERS_TABLE} WHERE order_id = $1 RETURNING order_id",
+                str(order_id),
+            )
+            return row is not None
+        finally:
+            await conn.close()
+
     async def claim_order(self, order_id: str) -> bool:
         """Reserva um order_id de forma ATÔMICA (anti-duplicata em webhooks concorrentes).
 

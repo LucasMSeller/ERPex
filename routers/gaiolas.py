@@ -57,32 +57,78 @@ async def _grid_context(request: Request, mensagem: str = "", erro: bool = False
 # página). Constantes abaixo são estimativa pra A4 — ainda sem teste em
 # impressora real (mesma ressalva já registrada pro `type:'pixel'` do QZ Tray).
 _GRUPOS_POR_LINHA = 3
-_LINHAS_PAGINA_1 = 70     # 70 linhas x 3 grupos = 210 itens (com cabeçalho+motorista)
-_LINHAS_CONTINUACAO = 95  # 95 linhas x 3 grupos = 285 itens (folha enxuta)
+# Recalculadas em 19/08/2026, quando a fonte subiu de 9px pra 10.5px e a folha
+# ganhou margem: a linha da tabela passou de ~13px pra ~15px de altura, então
+# cabe ~15% menos por folha. Ajustadas de novo em 24/08/2026: descer o nº do
+# romaneio pra fora da faixa não-imprimível custou 18px de altura útil (~1,2
+# linha), e o desconto é de 2 linhas porque arredondar pra baixo é o lado seguro.
+_LINHAS_PAGINA_1 = 56     # 56 linhas x 3 grupos = 168 itens (com cabeçalho+motorista)
+_LINHAS_CONTINUACAO = 78  # 78 linhas x 3 grupos = 234 itens (folha enxuta)
+# Quantas linhas de itens ainda deixam a Declaração + assinaturas caberem na MESMA
+# folha. Margem folgada de propósito: errar pra baixo custa uma folha a mais, errar
+# pra cima deixa a assinatura órfã na folha seguinte — que é o que não pode.
+_LINHAS_P1_COM_DECLARACAO = 39    # folha 1 (tem cabeçalho + motorista) = 117 itens
+_LINHAS_CONT_COM_DECLARACAO = 61  # folha de continuação (enxuta)      = 183 itens
 
 _CSS_TERMO = """
   * { box-sizing: border-box; }
-  body { font-family: Arial, Helvetica, sans-serif; color: #111; margin: 0; font-size: 9px; }
-  .pagina { position: relative; padding: 12px 16px; page-break-after: always; }
+  body { font-family: Arial, Helvetica, sans-serif; color: #111; margin: 0; font-size: 10.5px; }
+  /* Margem generosa em cima e nos lados: sem ela o texto sai colado na beirada
+     do papel (e impressora que aplica margem própria chega a cortar a grade). */
+  .pagina { position: relative; padding: 48px 28px 20px; page-break-after: always; }
   .pagina:last-child { page-break-after: auto; }
-  .romaneio-tag { position: absolute; top: 6px; left: 10px; font-size: 9px; font-weight: bold; color: #333; }
-  .pagina-tag { position: absolute; top: 16px; left: 10px; font-size: 8px; color: #666; }
+  /* O nº do romaneio saía cortado ao meio (24/08/2026): a 10px do topo ele caía
+     dentro da faixa que a impressora não imprime (~5mm). Desceu pra 26px (~7mm),
+     e o padding da folha subiu junto pra não empurrar a tag por cima do cabeçalho. */
+  .romaneio-tag { position: absolute; top: 26px; left: 28px; font-size: 10.5px; font-weight: bold; color: #333; }
+  .pagina-tag { position: absolute; top: 40px; left: 28px; font-size: 9.5px; color: #666; }
   .cabecalho { margin-top: 15px; }
-  h1 { font-size: 14px; margin: 0 0 1px; }
-  .sub { font-size: 9px; color: #555; margin-bottom: 6px; }
-  h2 { font-size: 9.5px; margin: 6px 0 3px; text-transform: uppercase; letter-spacing: .03em; }
-  table { width: 100%; border-collapse: collapse; font-size: 9px; margin-bottom: 4px; line-height: 1.1; }
+  h1 { font-size: 15.5px; margin: 0 0 1px; }
+  .sub { font-size: 10.5px; color: #555; margin-bottom: 6px; }
+  h2 { font-size: 11px; margin: 6px 0 3px; text-transform: uppercase; letter-spacing: .03em; }
+  table { width: 100%; border-collapse: collapse; font-size: 10.5px; margin-bottom: 4px; line-height: 1.1; }
   th, td { border: 1px solid #999; padding: 1px 4px; text-align: left; }
   th { background: #eee; }
   .motorista-table td { padding: 2px 5px; }
-  .motorista-table td:first-child { font-weight: bold; width: 110px; background: #f7f7f7; }
+  .motorista-table td:first-child { font-weight: bold; width: 125px; background: #f7f7f7; }
   .itens-table th.par { border-left: 2px solid #444; }
   .itens-table td.par { border-left: 2px solid #444; }
-  .total { font-size: 10px; margin: 6px 0; }
-  .declaracao { font-size: 10px; line-height: 1.4; margin: 10px 0 32px; text-align: justify; }
+  .total { font-size: 11.5px; margin: 6px 0; }
+  .declaracao { font-size: 11.5px; line-height: 1.4; margin: 10px 0 32px; text-align: justify; }
   .assinaturas { display: flex; gap: 60px; margin-top: 24px; }
-  .assinatura .linha { border-top: 1px solid #333; width: 260px; padding-top: 4px; font-size: 10px; }
+  .assinatura .linha { border-top: 1px solid #333; width: 260px; padding-top: 4px; font-size: 11.5px; }
 """
+
+
+def _fatiar_em_folhas(ids: list[str]) -> list[list[str]]:
+    """Divide os IDs em folhas de modo que a Declaração/assinaturas SEMPRE caibam
+    no fim da última folha — nunca sobra uma folha só com o bloco de assinatura.
+
+    Quando a relação inteira não cabe junto com a Declaração, o excedente da última
+    folha é empurrado pra uma folha nova em vez de a Declaração ir sozinha. Isso
+    troca uma folha em branco por uma folha útil: 200 itens saíam em 2 folhas com a
+    segunda quase vazia, e agora saem em 2 folhas cheias (150 + 50 e a assinatura)."""
+    cap_p1 = _LINHAS_PAGINA_1 * _GRUPOS_POR_LINHA
+    cap_cont = _LINHAS_CONTINUACAO * _GRUPOS_POR_LINHA
+    cap_p1_decl = _LINHAS_P1_COM_DECLARACAO * _GRUPOS_POR_LINHA
+    cap_cont_decl = _LINHAS_CONT_COM_DECLARACAO * _GRUPOS_POR_LINHA
+
+    if len(ids) <= cap_p1_decl:
+        return [ids]                      # tudo numa folha só, o caso comum
+
+    folhas = [ids[:cap_p1]]
+    resto = ids[cap_p1:]
+    while resto:
+        folhas.append(resto[:cap_cont])
+        resto = resto[cap_cont:]
+
+    cap_ultima = cap_p1_decl if len(folhas) == 1 else cap_cont_decl
+    if len(folhas[-1]) > cap_ultima:
+        # Não sobra espaço pra Declaração: passa o excedente adiante. Ele nunca é
+        # maior que uma folha, então isto não se repete.
+        folhas.append(folhas[-1][cap_ultima:])
+        folhas[-2] = folhas[-2][:cap_ultima]
+    return folhas
 
 
 def _linha_romaneio_pagina(romaneio_id: str, pagina: int, total_paginas: int) -> str:
@@ -117,21 +163,15 @@ def _montar_guia_retirada_html(romaneio_id: str, gaiola: str, motorista_nome: st
                                 motorista_interno: bool = False) -> str:
     """Termo de Retirada de Encomendas — modelo aprovado pelo jurídico (2026-07-31),
     documento de página inteira (não ZPL), impresso via QZ Tray na impressora
-    comum configurada em PRINTER_GUIA_NAME. Pagina automaticamente quando a
-    gaiola tem mais pacotes do que cabe numa folha — Declaração/assinatura
-    sempre isoladas na última folha."""
+    comum configurada em PRINTER_GUIA_NAME.
+
+    A Declaração/assinaturas fica sempre no fim da ÚLTIMA folha, junto da relação —
+    nunca partida ao meio (o jurídico não aceita) e nunca sozinha numa folha em
+    branco. Ver `_fatiar_em_folhas`."""
     agora = datetime.now(_BR_TZ).strftime("%d/%m/%Y %H:%M")
     ids = [p["id_exped"] for p in pacotes]
-
-    # Fatia os IDs em folhas: a 1ª (menor, tem cabeçalho+motorista) e as demais (maiores).
-    folhas: list[list[str]] = []
-    cap_pagina1 = _LINHAS_PAGINA_1 * _GRUPOS_POR_LINHA
-    folhas.append(ids[:cap_pagina1])
-    resto = ids[cap_pagina1:]
-    cap_continuacao = _LINHAS_CONTINUACAO * _GRUPOS_POR_LINHA
-    for i in range(0, len(resto), cap_continuacao):
-        folhas.append(resto[i:i + cap_continuacao])
-    total_paginas = len(folhas) + 1   # +1 = folha final da Declaração/assinatura
+    folhas = _fatiar_em_folhas(ids)
+    total_paginas = len(folhas)
 
     if motorista_interno:
         meta_html = '<tr><td>Retirada</td><td colspan="3">Funcionário interno (sem motorista externo)</td></tr>'
@@ -146,11 +186,32 @@ def _montar_guia_retirada_html(romaneio_id: str, gaiola: str, motorista_nome: st
         )
     meta_html += f'<tr><td>Identificação da gaiola</td><td colspan="3">{html.escape(gaiola)}</td></tr>'
 
+    if motorista_interno:
+        assinatura_motorista_html = ""
+    else:
+        assinatura_motorista_html = """
+      <div class="assinatura">
+        <div class="linha">Assinatura do motorista<br>Nome e CPF</div>
+      </div>"""
+    declaracao_html = f"""
+      <div class="total">Total de itens retirados: <b>{len(ids)}</b></div>
+      <h2>Declaração</h2>
+      <div class="declaracao">Declaro, para os devidos fins, que recebi e conferi a totalidade das
+        encomendas relacionadas neste documento, identificadas pelos respectivos IDs, assumindo a
+        responsabilidade pela guarda, transporte e entrega dos referidos itens a partir deste momento.</div>
+      <div class="assinaturas">{assinatura_motorista_html}
+        <div class="assinatura">
+          <div class="linha">Responsável pela expedição (empresa)</div>
+        </div>
+      </div>"""
+
     paginas_html = []
     numero_atual = 1
     for idx, ids_pagina in enumerate(folhas):
         pagina_num = idx + 1
-        tag = _linha_romaneio_pagina(romaneio_id, pagina_num, total_paginas)
+        # "Página 1 de 1" é ruído: numeração só faz sentido quando há o que numerar.
+        tag = (_linha_romaneio_pagina(romaneio_id, pagina_num, total_paginas) if total_paginas > 1
+               else f'<div class="romaneio-tag">Romaneio Nº {html.escape(romaneio_id)}</div>')
         tabela = _tabela_itens_html(ids_pagina, numero_atual)
         numero_atual += len(ids_pagina)
         if idx == 0:
@@ -165,30 +226,9 @@ def _montar_guia_retirada_html(romaneio_id: str, gaiola: str, motorista_nome: st
     {tabela}"""
         else:
             corpo = f'<div class="cabecalho">{tabela}</div>'
+        if pagina_num == total_paginas:
+            corpo += declaracao_html   # a Declaração fecha a última folha
         paginas_html.append(f'<div class="pagina">{tag}{corpo}</div>')
-
-    if motorista_interno:
-        assinatura_motorista_html = ""
-    else:
-        assinatura_motorista_html = """
-      <div class="assinatura">
-        <div class="linha">Assinatura do motorista<br>Nome e CPF</div>
-      </div>"""
-    tag_final = _linha_romaneio_pagina(romaneio_id, total_paginas, total_paginas)
-    paginas_html.append(f"""<div class="pagina">{tag_final}
-    <div class="cabecalho">
-      <div class="total">Total de itens retirados: <b>{len(ids)}</b></div>
-      <h2>Declaração</h2>
-      <div class="declaracao">Declaro, para os devidos fins, que recebi e conferi a totalidade das
-        encomendas relacionadas neste documento, identificadas pelos respectivos IDs, assumindo a
-        responsabilidade pela guarda, transporte e entrega dos referidos itens a partir deste momento.</div>
-      <div class="assinaturas">{assinatura_motorista_html}
-        <div class="assinatura">
-          <div class="linha">Responsável pela expedição (empresa)</div>
-        </div>
-      </div>
-    </div>
-  </div>""")
 
     return f"""<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
 <title>Termo de Retirada — {html.escape(romaneio_id)}</title>
@@ -232,6 +272,37 @@ async def bipar(request: Request, codigo: str = Form(...)):
     return templates.TemplateResponse("_gaiolas_grid.html", ctx)
 
 
+_INVALIDOS_NO_NOME = r'\/:*?"<>|'
+
+
+def _nome_do_documento(gaiola: str, quem: str, saida: int) -> str:
+    """Nome do trabalho de impressão — vira o nome do arquivo quando a saída é
+    "Imprimir em PDF", que é como a guia costuma ser arquivada.
+
+    Formato: "Gaiola 2 - Interno - 13-08-2026 - saida 3". O contador é a ordem da
+    coleta NO DIA, não o nº do romaneio (esse é global e nunca reinicia): o que se
+    quer saber ao olhar a pasta é quantas gaiolas saíram naquele dia."""
+    dia = datetime.now(_BR_TZ).strftime("%d-%m-%Y")
+    bruto = f"Gaiola {gaiola} - {quem} - {dia} - saida {saida}"
+    bruto = bruto.replace("Gaiola Gaiola ", "Gaiola ")   # a gaiola já vem como "Gaiola 2"
+    return "".join(c for c in bruto if c not in _INVALIDOS_NO_NOME).strip()
+
+
+def _quem_retirou(body: RetiradaIn, transportadora: str, nome: str, pacotes: list[dict]) -> str:
+    """Quem está levando a gaiola, pro nome do arquivo. Interno é o caso mais comum
+    no galpão; sendo externo, a transportadora identifica melhor que o motorista
+    (o mesmo carro volta com gente diferente). Sem nenhum dos dois, cai pras lojas
+    donas dos pacotes, que é o que sempre existe."""
+    if body.motorista_interno:
+        return "Interno"
+    if transportadora:
+        return transportadora
+    if nome:
+        return nome
+    lojas = sorted({(p.get("empresa") or "").strip() for p in pacotes if p.get("empresa")})
+    return " + ".join(lojas) if lojas else "Externo"
+
+
 @router.post("/{gaiola}/retirada/preparar")
 async def preparar_retirada(gaiola: str, body: RetiradaIn):
     """Monta a guia (HTML pra imprimir) com o snapshot atual da gaiola. NÃO
@@ -246,7 +317,12 @@ async def preparar_retirada(gaiola: str, body: RetiradaIn):
     romaneio_id = await db_service.get_next_romaneio_id()
     guia_html = _montar_guia_retirada_html(
         romaneio_id, gaiola, nome, cpf, placa, transportadora, body.copias, pacotes, body.motorista_interno)
-    return {"ok": True, "html": guia_html, "n_pacotes": len(pacotes), "romaneio_id": romaneio_id}
+    # +1 porque esta coleta ainda não foi registrada (o /confirmar é que grava):
+    # a guia que está saindo da impressora é a próxima da fila do dia.
+    saida = await db_service.contar_retiradas_do_dia() + 1
+    quem = _quem_retirou(body, transportadora, nome, pacotes)
+    return {"ok": True, "html": guia_html, "n_pacotes": len(pacotes), "romaneio_id": romaneio_id,
+            "nome_documento": _nome_do_documento(gaiola, quem, saida), "saida_do_dia": saida}
 
 
 @router.post("/{gaiola}/retirada/confirmar")

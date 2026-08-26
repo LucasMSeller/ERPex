@@ -173,8 +173,17 @@
         return conectarQZ()
           .then(function () { return getPrinter(PRINTER_GUIA); })
           .then(function (printer) {
-            var cfg = qz.configs.create(printer, { copies: dados.copias });
-            return qz.print(cfg, [{ type: 'pixel', format: 'html', data: data.html }]);
+            // jobName vira o nome do arquivo quando a saída é "Imprimir em PDF".
+            var cfg = qz.configs.create(printer, {
+              copies: dados.copias,
+              jobName: data.nome_documento,
+            });
+            // flavor 'plain' diz que `data` É o HTML. Sem isso o QZ assume 'file' e
+            // tenta BUSCAR o conteúdo como se fosse um caminho — o servidor responde
+            // 404 e o que sai impresso é {"detail":"Not Found"}.
+            return qz.print(cfg, [{
+              type: 'pixel', format: 'html', flavor: 'plain', data: data.html,
+            }]);
           });
       })
       .then(function () {
