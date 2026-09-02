@@ -100,11 +100,17 @@ async def sync_all_products() -> list[dict]:
     return results
 
 
-async def _skus_reais_do_ml(stores: list[dict], token_store: TokenStore) -> set[str]:
-    """Busca os SKUs reais (sku_is_real) direto no Mercado Livre pra cada loja
-    da lista — mesma chamada `get_all_items` + resolução de SKU que a
-    sincronização de Produtos usa."""
-    skus: set[str] = set()
+async def _skus_por_loja(stores: list[dict], token_store: TokenStore) -> dict[str, set[str]]:
+    """Busca os SKUs reais (sku_is_real) direto no Mercado Livre e devolve
+    {user_id: {skus}} — mesma chamada `get_all_items` + resolução de SKU que a
+    sincronização de Produtos usa.
+
+    Guardar por loja (e não a união) é o que permite gravar o vínculo
+    SKU↔loja: é essa resposta do ML que diz quem anuncia o quê.
+
+    Loja que falhar fica de fora do resultado — assim ela não é confundida com
+    "loja de catálogo vazio", que apagaria todos os vínculos dela."""
+    por_loja: dict[str, set[str]] = {}
     for store in stores:
         meli = MeliService(store, token_store=token_store)
         try:
@@ -113,39 +119,46 @@ async def _skus_reais_do_ml(stores: list[dict], token_store: TokenStore) -> set[
             logger.error("Erro ao buscar itens do ML pra reconciliar Endereçamento (%s): %s",
                          store.get("company_key"), e)
             continue
-        for item in items:
-            product = Product.from_meli_item(item, store["company_key"])
-            if product.sku_is_real:
-                skus.add(product.sku)
-    return skus
+        skus = {p.sku for p in (Product.from_meli_item(i, store["company_key"]) for i in items)
+                if p.sku_is_real}
+        por_loja[str(store["user_id"])] = skus
+    return por_loja
 
 
-async def reconciliar_enderecos(company_key: str | None = None, sku_prefixo: str | None = None) -> dict:
+async def reconciliar_enderecos(company_key: str | None = None) -> dict:
     """Botão "Vincular SKUs" em /enderecos: busca os SKUs reais DIRETO no
     Mercado Livre — não depende de rodar antes uma sincronização de Produtos
     nem da aba Produtos do Sheets estar em dia. Funciona pra qualquer loja já
-    conectada (Firestore), inclusive uma nova, sem precisar mexer no código.
+    conectada, inclusive uma nova, sem precisar mexer no código.
 
-    `company_key` informado (botão por loja): busca só essa loja. Se
-    `sku_prefixo` também vier (loja com prefixo configurado em
-    /gerente/lojas), remove com segurança os SKUs que sumiram do catálogo
-    dessa loja (só entre os que começam com esse prefixo — nunca mexe no
-    espaço de SKUs de outra loja). Sem prefixo configurado, só insere (nunca
-    remove — não dá pra saber com segurança quais endereços existentes
-    "pertencem" só a essa loja). `company_key=None` (reconciliação global,
-    todas as lojas juntas): insere os novos E remove os que sumiram de TODAS
-    as lojas — seguro, porque compara contra a união de todo mundo."""
+    Atualiza duas coisas: o Endereçamento (1 linha por SKU, em branco pros
+    novos) e o vínculo SKU↔loja (1 linha por par), que é o que monta as
+    gavetas da tela e guarda o interruptor `ativo`.
+
+    `company_key` informado (botão por loja): só essa loja. `None`: todas.
+
+    Um endereço só é apagado quando o SKU sai do catálogo de uma loja E
+    nenhuma outra loja o anuncia. O vínculo responde isso com precisão, sem
+    depender do prefixo do nome — que deixou de indicar posse no dia em que
+    uma conta passou a vender SKU de outra linha."""
     token_store = TokenStore()
     if company_key:
         store = await token_store.get_by_company_or_nickname(company_key)
-        skus = await _skus_reais_do_ml([store] if store else [], token_store)
-        if sku_prefixo:
-            return await enderecos_db.sync_skus(list(skus), sku_prefixo=sku_prefixo)
-        novos = await enderecos_db.ensure_addresses_for_skus(list(skus))
-        return {"novos": novos, "removidos": 0, "total": len(skus)}
+        stores = [store] if store else []
+    else:
+        stores = await token_store.list_stores()
 
-    skus = await _skus_reais_do_ml(await token_store.list_stores(), token_store)
-    return await enderecos_db.sync_skus(list(skus))
+    catalogos = await _skus_por_loja(stores, token_store)
+    todos: set[str] = set().union(*catalogos.values()) if catalogos else set()
+
+    # Endereço primeiro: a FK de sku_lojas exige que o SKU já exista.
+    novos = await enderecos_db.ensure_addresses_for_skus(list(todos))
+    orfaos: set[str] = set()
+    for user_id, skus in catalogos.items():
+        orfaos |= set(await enderecos_db.set_vinculos_da_loja(user_id, list(skus)))
+    removidos = await enderecos_db.remover_orfaos(list(orfaos))
+
+    return {"novos": novos, "removidos": removidos, "total": len(todos)}
 
 
 async def sync_one_company(company_key: str) -> dict:

@@ -172,12 +172,41 @@ async def migrate_lojas_now():
 
 
 @router.get("/vincular-skus")
-async def vincular_skus_now(company: str | None = Query(None), sku_prefixo: str | None = Query(None)):
-    """Reconcilia o Endereçamento com os SKUs reais atuais (mesma ação do botão
-    "Vincular SKUs" em /enderecos). Sem `company`: todas as lojas. Com `company`
-    (+ opcionalmente `sku_prefixo`): só 1 loja, mesmo escopo do botão por loja."""
+async def vincular_skus_now(company: str | None = Query(None)):
+    """Reconcilia o Endereçamento E o vínculo SKU↔loja com os SKUs reais atuais
+    (mesma ação do botão "Vincular SKUs" em /enderecos). Sem `company`: todas as
+    lojas. Com `company`: só 1 loja, mesmo escopo do botão por loja."""
     from services.sync_service import reconciliar_enderecos
-    return await reconciliar_enderecos(company_key=company, sku_prefixo=sku_prefixo)
+    return await reconciliar_enderecos(company_key=company)
+
+
+@router.get("/limpar-enderecos-sem-vinculo")
+async def limpar_enderecos_sem_vinculo(aplicar: bool = Query(False)):
+    """Apaga os endereços que nenhuma loja anuncia — os que entraram pelo sync
+    de Produtos ou pelo "Novo SKU" da tela e nunca foram confirmados por um
+    catálogo do ML. São exatamente as linhas que aparecem sem o botão Ativo.
+
+    Só MOSTRA por padrão; `?aplicar=true` é que apaga.
+
+    E recusa aplicar enquanto houver loja conectada sem vínculo nenhum: nesse
+    caso a lista está cheia de SKU válido que só não foi vinculado ainda, e
+    apagar seria estrago. Rode o "Vincular SKUs" de cada loja primeiro."""
+    lojas = await TokenStore().list_stores()
+    vinculos = await enderecos_db.get_vinculos()
+    nao_vinculadas = [l.get("company_key") for l in lojas
+                      if not vinculos.get(str(l.get("user_id") or ""))]
+    orfaos = await enderecos_db.enderecos_sem_vinculo()
+
+    if nao_vinculadas:
+        return {"aplicado": False,
+                "motivo": "Rode 'Vincular SKUs' nestas lojas antes de limpar.",
+                "lojas_sem_vinculo": nao_vinculadas,
+                "seriam_apagados": len(orfaos)}
+    if not aplicar:
+        return {"aplicado": False, "seriam_apagados": len(orfaos),
+                "amostra": orfaos[:50],
+                "para_aplicar": "repita a chamada com ?aplicar=true"}
+    return {"aplicado": True, "removidos": await enderecos_db.remover_enderecos_sem_vinculo()}
 
 
 @router.get("/refresh-fiscal")

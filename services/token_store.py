@@ -92,9 +92,11 @@ class TokenStore:
             await conn.close()
 
     async def set_sku_prefixo(self, user_id: str, sku_prefixo: str) -> None:
-        """Prefixo do SKU dessa loja (definido pelo Gerente em /gerente/lojas),
-        usado só pra AGRUPAR visualmente a tela de Endereçamento por loja —
-        o endereço em si não pertence a nenhuma loja (ver services/enderecos_db.py)."""
+        """Prefixo do SKU dessa loja (definido pelo Gerente em /gerente/lojas):
+        rótulo da linha de produto, nunca posse. Uma conta pode vender SKU de
+        outra linha, então quem diz o que aparece na gaveta de cada loja é a
+        `sku_lojas` — o prefixo só cobre o SKU ainda sem vínculo registrado.
+        O endereço em si não pertence a loja nenhuma (services/enderecos_db.py)."""
         conn = await _get_connection()
         try:
             await conn.execute("UPDATE lojas SET sku_prefixo = $2 WHERE user_id = $1", str(user_id), sku_prefixo)

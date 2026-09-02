@@ -221,6 +221,21 @@ CREATE TABLE IF NOT EXISTS lojas (
     atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Quais SKUs cada loja ANUNCIA hoje. O prefixo do nome diz de quem é o produto
+-- (a linha/cadastro); isto diz quem vende — e uma conta pode vender SKU de outra
+-- linha. A chave é o PAR, então `ativo` desliga o SKU numa loja só, sem tocar na
+-- outra e sem tocar no endereço (que é 1 por SKU, ver `enderecos` acima).
+-- Preenchida pelo botão "Vincular SKUs", que já busca o catálogo real no ML.
+-- Depende de `enderecos` e `lojas`, por isso vem depois das duas.
+CREATE TABLE IF NOT EXISTS sku_lojas (
+    sku           TEXT NOT NULL REFERENCES enderecos(sku) ON DELETE CASCADE,
+    loja_user_id  TEXT NOT NULL REFERENCES lojas(user_id) ON DELETE CASCADE,
+    ativo         BOOLEAN NOT NULL DEFAULT true,
+    atualizado_em TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (sku, loja_user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sku_lojas_loja ON sku_lojas (loja_user_id);
+
 -- Reserva atômica de order_id p/ dedup de webhooks concorrentes/reenviados —
 -- equivalente ao antigo ref.create() do Firestore (só o 1º INSERT vence).
 CREATE TABLE IF NOT EXISTS pedidos_processados (

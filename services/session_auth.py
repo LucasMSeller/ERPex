@@ -17,7 +17,11 @@ def check_password(senha: str) -> bool:
 
 
 def require_login(request: Request) -> None:
-    if not request.session.get("auth"):
+    """Telas operacionais (Mural/Embalagem/Gaiolas/Endereços). A sessão de
+    gerente também passa: quem tem a senha do Gerente já pode reverter status e
+    desconectar loja, então barrá-lo no Mural só obrigava a logar duas vezes.
+    O contrário continua valendo — `auth` NÃO abre a tela do Gerente."""
+    if not (request.session.get("auth") or request.session.get("gerente")):
         raise NotAuthenticated("/login")
 
 
@@ -31,7 +35,7 @@ def require_gerente(request: Request) -> None:
 
 
 def require_login_or_gerente(request: Request) -> None:
-    """Aceita sessão operacional OU de gerente — usado em rotas compartilhadas
-    (ex.: impressão/assinatura QZ Tray) que qualquer um dos dois pode acessar."""
-    if not (request.session.get("auth") or request.session.get("gerente")):
-        raise NotAuthenticated("/login")
+    """Sinônimo de `require_login` desde que a sessão de gerente passou a valer
+    nas telas operacionais. Mantido pelo nome explícito nas rotas compartilhadas
+    (impressão/assinatura QZ Tray), onde deixa claro que os dois entram."""
+    require_login(request)

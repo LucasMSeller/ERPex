@@ -1,3 +1,45 @@
+{# A linha e o cabeçalho viram macro porque aparecem em dois lugares: na lista
+   da loja e na subgaveta dos desativados. Mesmo grid nos dois, senão as colunas
+   desalinham entre uma e outra. #}
+{% set GRID = "grid grid-cols-[1fr_92px_92px_92px_64px_72px] gap-2 px-3 py-2" %}
+
+{% macro cabecalho() %}
+<div class="{{ GRID }} bg-slate-50 text-slate-600 text-xs font-medium">
+  <div>SKU</div><div>Corredor</div><div>Estante</div><div>Prateleira</div><div>Nesta loja</div><div></div>
+</div>
+{% endmacro %}
+
+{% macro linha(e) %}
+<form class="{{ GRID }} items-center"
+      hx-post="/enderecos" hx-include="#busca-enderecos" hx-target="#enderecos-lista" hx-swap="innerHTML">
+  <input type="hidden" name="sku" value="{{ e.sku }}">
+  <div class="font-mono text-sm truncate self-center">{{ e.sku }}</div>
+  <input name="corredor" value="{{ e.corredor }}" class="border border-slate-300 rounded px-2 py-1 text-sm w-full">
+  <input name="estante" value="{{ e.estante }}" class="border border-slate-300 rounded px-2 py-1 text-sm w-full">
+  <input name="prateleira" value="{{ e.prateleira }}" class="border border-slate-300 rounded px-2 py-1 text-sm w-full">
+  {# Interruptor do par (SKU, loja): desligar aqui não mexe no endereço nem
+     nas outras lojas. Sem vínculo registrado ainda, não há o que alternar. #}
+  <div class="flex items-center">
+    {% if e.loja_user_id %}
+    <button type="button" hx-post="/enderecos/vinculo" hx-include="#busca-enderecos"
+            hx-vals='{"sku": {{ e.sku|tojson }}, "loja_user_id": {{ e.loja_user_id|tojson }}, "ativo": "{{ 0 if e.ativo else 1 }}"}'
+            hx-target="#enderecos-lista" hx-swap="innerHTML" hx-disabled-elt="this"
+            title="{{ 'Desligar este SKU nesta loja' if e.ativo else 'Religar este SKU nesta loja' }}"
+            class="rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide disabled:opacity-50
+                   {% if e.ativo %}bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-700
+                   {% else %}bg-white border-slate-300 text-slate-500 hover:bg-slate-50{% endif %}">
+      {{ "Ativo" if e.ativo else "Off" }}
+    </button>
+    {% endif %}
+  </div>
+  <div class="flex items-center gap-1">
+    <button type="submit" hx-disabled-elt="this"
+            class="bg-slate-900 text-white rounded px-2 py-1 text-xs hover:bg-slate-800 disabled:opacity-50">Salvar</button>
+    <span class="htmx-indicator text-xs text-slate-500">…</span>
+  </div>
+</form>
+{% endmacro %}
+
 {% if mensagem %}
 <div class="mb-3 text-sm text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2 max-w-2xl flex items-center justify-between">
   <span>{{ mensagem }}</span>
@@ -7,15 +49,16 @@
 {% if not grupos %}
 <p class="text-slate-400 text-sm">Nenhum SKU cadastrado ainda.</p>
 {% endif %}
-{% for loja, enderecos in grupos %}
-<details class="bg-white border border-slate-200 rounded-xl max-w-2xl mb-4 overflow-hidden" {% if busca %}open{% endif %}>
+{% for g in grupos %}
+<details class="bg-white border border-slate-200 rounded-xl max-w-2xl mb-4 overflow-hidden"
+         {% if busca or g.nome == abrir %}open{% endif %}>
   <summary class="cursor-pointer select-none px-3 py-2 bg-slate-100 text-slate-700 text-sm font-semibold flex items-center justify-between">
-    <span>{{ loja }}</span>
+    <span>{{ g.nome }}</span>
     <span class="flex items-center gap-2">
-      <span class="text-xs font-normal text-slate-500">{{ enderecos|length }} SKU{{ "s" if enderecos|length != 1 else "" }}</span>
-      {% if loja in lojas %}
+      <span class="text-xs font-normal text-slate-500">{{ g.ativos|length }} SKU{{ "s" if g.ativos|length != 1 else "" }}</span>
+      {% if g.nome in lojas %}
       <button type="button" onclick="event.preventDefault(); event.stopPropagation();"
-              hx-post="/enderecos/vincular-skus/{{ loja }}" hx-include="#busca-enderecos"
+              hx-post="/enderecos/vincular-skus/{{ g.nome }}" hx-include="#busca-enderecos"
               hx-target="#enderecos-lista" hx-swap="innerHTML"
               hx-indicator="#vincular-indicador-{{ loop.index }}" hx-disabled-elt="this"
               class="text-xs font-normal border border-slate-300 rounded px-2 py-1 bg-white hover:bg-slate-50 disabled:opacity-50">
@@ -26,24 +69,28 @@
     </span>
   </summary>
   <div class="divide-y divide-slate-100">
-    <div class="grid grid-cols-[1fr_100px_100px_100px_80px] gap-2 px-3 py-2 bg-slate-50 text-slate-600 text-xs font-medium">
-      <div>SKU</div><div>Corredor</div><div>Estante</div><div>Prateleira</div><div></div>
-    </div>
-    {% for e in enderecos %}
-    <form class="grid grid-cols-[1fr_100px_100px_100px_80px] gap-2 px-3 py-2 items-center"
-          hx-post="/enderecos" hx-include="#busca-enderecos" hx-target="#enderecos-lista" hx-swap="innerHTML">
-      <input type="hidden" name="sku" value="{{ e.sku }}">
-      <div class="font-mono text-sm truncate self-center">{{ e.sku }}</div>
-      <input name="corredor" value="{{ e.corredor }}" class="border border-slate-300 rounded px-2 py-1 text-sm w-full">
-      <input name="estante" value="{{ e.estante }}" class="border border-slate-300 rounded px-2 py-1 text-sm w-full">
-      <input name="prateleira" value="{{ e.prateleira }}" class="border border-slate-300 rounded px-2 py-1 text-sm w-full">
-      <div class="flex items-center gap-1">
-        <button type="submit" hx-disabled-elt="this"
-                class="bg-slate-900 text-white rounded px-2 py-1 text-xs hover:bg-slate-800 disabled:opacity-50">Salvar</button>
-        <span class="htmx-indicator text-xs text-slate-500">…</span>
-      </div>
-    </form>
-    {% endfor %}
+    {{ cabecalho() }}
+    {% for e in g.ativos %}{{ linha(e) }}{% endfor %}
+    {% if not g.ativos %}
+    <p class="px-3 py-3 text-xs text-slate-400">Nenhum SKU ativo nesta loja.</p>
+    {% endif %}
   </div>
+
+  {# Subgaveta: o que foi desligado nesta loja sai da lista de cima mas continua
+     alcançável, senão não haveria como religar. O endereço segue o mesmo — quem
+     está desligado é o vínculo com ESTA loja, não o SKU. #}
+  {% if g.desativados %}
+  <details class="border-t border-slate-200 bg-slate-50"
+           {% if busca or (g.nome == abrir and abrir_desativados) %}open{% endif %}>
+    <summary class="cursor-pointer select-none px-3 py-2 text-slate-500 text-xs font-medium flex items-center gap-2">
+      <span>Desativados nesta loja</span>
+      <span class="text-slate-400">({{ g.desativados|length }})</span>
+    </summary>
+    <div class="divide-y divide-slate-100 border-t border-slate-200 bg-white">
+      {{ cabecalho() }}
+      {% for e in g.desativados %}{{ linha(e) }}{% endfor %}
+    </div>
+  </details>
+  {% endif %}
 </details>
 {% endfor %}

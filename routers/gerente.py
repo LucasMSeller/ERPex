@@ -278,10 +278,15 @@ async def gerente_dashboard_dados(request: Request,
 
 @router.get("/logout")
 async def gerente_logout(request: Request):
-    """Sai só da área do Gerente (mantém a sessão operacional, se houver) e volta
-    pro painel de colaborador — diferente do /logout geral, que desloga de tudo."""
+    """Sai só da área do Gerente (mantém a sessão operacional, se houver) —
+    diferente do /logout geral, que desloga de tudo.
+
+    Quem entrou SÓ pelo Gerente não tem sessão operacional, e desde que a
+    sessão de gerente passou a valer no Mural (services/session_auth.py) ele
+    acabaria de perder o acesso — mandar pro /mural cairia direto no /login."""
     request.session.pop("gerente", None)
-    return RedirectResponse("/mural", status_code=303)
+    destino = "/mural" if request.session.get("auth") else "/login"
+    return RedirectResponse(destino, status_code=303)
 
 
 @router.get("/pedidos")
@@ -421,9 +426,10 @@ async def definir_cor_loja(user_id: str, cor: str = Form(...)):
 
 @router.post("/lojas/{user_id}/prefixo")
 async def definir_prefixo_loja(user_id: str, sku_prefixo: str = Form("")):
-    """Prefixo do SKU dessa loja, informado pelo Gerente — usado só pra agrupar
-    a tela de Endereçamento por loja (accordion) e pra reconciliar com
-    segurança os SKUs removidos de 1 loja só."""
+    """Prefixo do SKU dessa loja, informado pelo Gerente — rótulo da linha de
+    produto. Quem monta as gavetas do Endereçamento é o vínculo SKU↔loja
+    (`sku_lojas`); o prefixo só entra como rede de segurança pros SKUs que
+    ainda não têm vínculo registrado."""
     await TokenStore().set_sku_prefixo(user_id, sku_prefixo.strip().upper())
     return RedirectResponse("/gerente/lojas", status_code=303)
 
